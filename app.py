@@ -1,9 +1,13 @@
 # app.py
 # Umfangreiche Streamlit Web-App: Audit + Betreiberpflichten + Dashboard + Uploads + PDF + Outlook/Teams Notifications
 #
+# ✅ Angepasst auf deine 5 Hotels (Codes 6502/6513/6527/6551/6595)
+# ✅ UI zeigt überall "CODE – HOTELNAME" statt H1–H5
+# ✅ Direktor/Techniker sehen automatisch nur ihr eigenes Hotel (über hotel_code)
+#
 # Outlook (Graph) via Client Credentials:
 #   MS_TENANT_ID, MS_CLIENT_ID, MS_CLIENT_SECRET
-#   MAIL_SENDER_UPN   (z.B. shared mailbox oder User, in dessen Kontext gesendet werden darf)
+#   MAIL_SENDER_UPN   (Mailbox/User, in dessen Kontext gesendet werden darf)
 #
 # Teams via Incoming Webhook:
 #   TEAMS_WEBHOOK_URL
@@ -31,14 +35,24 @@ from reportlab.lib.units import mm
 
 APP_TITLE = "Audit & Betreiberpflichten – Hotel Web-App"
 DB_PATH = os.environ.get("AUDIT_APP_DB", "audit_app.db")
-UPLOAD_DIR = os.environ.get("AUDIT_APP_UPLOAD_DIR", "uploads")  # local folder
+UPLOAD_DIR = os.environ.get("AUDIT_APP_UPLOAD_DIR", "uploads")
 APP_BASE_URL = os.environ.get("APP_BASE_URL", "").rstrip("/")
+
+# Deine Hotels (Code -> Name, Stadt)
+HOTELS = [
+    ("6502", "Hotel München City Center Affiliated by Melia", "München"),
+    ("6513", "Hotel Frankfurt Messe Affiliated by Melia", "Frankfurt"),
+    ("6527", "INNSiDE by Meliá München Parkstadt Schwabing", "München"),
+    ("6551", "INNSiDE by Meliá Frankfurt Ostend", "Frankfurt"),
+    ("6595", "Melia Frankfurt City", "Frankfurt"),
+]
+HOTEL_CODES = [h[0] for h in HOTELS]
 
 # Microsoft Graph / Outlook
 MS_TENANT_ID = os.environ.get("MS_TENANT_ID")
 MS_CLIENT_ID = os.environ.get("MS_CLIENT_ID")
 MS_CLIENT_SECRET = os.environ.get("MS_CLIENT_SECRET")
-MAIL_SENDER_UPN = os.environ.get("MAIL_SENDER_UPN")  # sender mailbox/user principal name
+MAIL_SENDER_UPN = os.environ.get("MAIL_SENDER_UPN")
 
 # Teams
 TEAMS_WEBHOOK_URL = os.environ.get("TEAMS_WEBHOOK_URL")
@@ -113,7 +127,6 @@ def ensure_upload_dir():
     os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 def safe_filename(name: str) -> str:
-    # very simple
     name = name.replace("\\", "_").replace("/", "_")
     return "".join(c for c in name if c.isalnum() or c in (" ", ".", "_", "-", "(", ")")).strip()
 
@@ -225,7 +238,6 @@ def init_db():
         FOREIGN KEY (audit_id) REFERENCES audits(id) ON DELETE SET NULL
     );
 
-    -- Attachments: can be linked to compliance/audit/action
     CREATE TABLE IF NOT EXISTS attachments (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         hotel_code TEXT NOT NULL,
@@ -246,36 +258,34 @@ def seed_if_empty():
     conn = db()
     cur = conn.cursor()
 
+    # Hotels
     cur.execute("SELECT COUNT(*) c FROM hotels")
     if cur.fetchone()["c"] == 0:
         now = utc_now_iso()
-        hotels = [
-    ("6502","Hotel München City Center Affiliated by Melia","München",None,None,"","",now),
-    ("6513","Hotel Frankfurt Messe Affiliated by Melia","Frankfurt",None,None,"","",now),
-    ("6527","INNSiDE by Meliá München Parkstadt Schwabing","München",None,None,"","",now),
-    ("6551","INNSiDE by Meliá Frankfurt Ostend","Frankfurt",None,None,"","",now),
-    ("6595","Melia Frankfurt City","Frankfurt",None,None,"","",now),
-]
+        rows = [(code, name, city, None, None, "", "", now) for code, name, city in HOTELS]
         cur.executemany("""
             INSERT INTO hotels(code,name,city,rooms,sqm,director_name,technician_name,created_at)
             VALUES (?,?,?,?,?,?,?,?)
-        """, hotels)
+        """, rows)
 
+    # Users
     cur.execute("SELECT COUNT(*) c FROM users")
     if cur.fetchone()["c"] == 0:
         now = utc_now_iso()
+        # Default admin
         cur.execute("""
             INSERT INTO users(email,name,password_hash,role,hotel_code,is_active,created_at)
             VALUES (?,?,?,?,?,?,?)
         """, ("admin@local", "Admin", sha256("admin123"), "Admin", None, 1, now))
 
-        # Example directors
-        for hc in ["6502","6513","6527","6551","6595"]:
+        # Default directors for each hotel (password: director123)
+        for hc, hname, _ in HOTELS:
             cur.execute("""
                 INSERT INTO users(email,name,password_hash,role,hotel_code,is_active,created_at)
                 VALUES (?,?,?,?,?,?,?)
-            """, (f"direktor_{hc.lower()}@local", f"Direktor {hc}", sha256("director123"), "Direktor", hc, 1, now))
+            """, (f"direktor_{hc}@local", f"Direktor {hc} – {hname}", sha256("director123"), "Direktor", hc, 1, now))
 
+    # Audit questions
     cur.execute("SELECT COUNT(*) c FROM audit_questions")
     if cur.fetchone()["c"] == 0:
         questions = []
@@ -315,6 +325,7 @@ def seed_if_empty():
         ]
         cur.executemany("INSERT INTO audit_questions(norm,chapter,question,is_active) VALUES (?,?,?,1)", questions)
 
+    # Compliance seed items
     cur.execute("SELECT COUNT(*) c FROM compliance_items")
     if cur.fetchone()["c"] == 0:
         now = utc_now_iso()
@@ -331,7 +342,7 @@ def seed_if_empty():
             ("Fettabscheider", "Entsorgung/Inspektion", 1),
         ]
         rows = []
-        for hc in ["H1","H2","H3","H4","H5"]:
+        for hc in HOTEL_CODES:
             for asset, task, interval in templates:
                 rows.append((hc, asset, task, interval, None, None, "", "", "", now))
         cur.executemany("""
@@ -364,6 +375,10 @@ def get_hotels() -> pd.DataFrame:
     df = pd.read_sql_query("SELECT * FROM hotels ORDER BY code", conn)
     conn.close()
     return df
+
+def hotel_label_map(hotels_df: pd.DataFrame) -> Dict[str, str]:
+    # code -> "code – name"
+    return {r["code"]: f"{r['code']} – {r['name']}" for _, r in hotels_df.iterrows()}
 
 def get_user_by_email(email: str):
     conn = db()
@@ -404,10 +419,17 @@ def upsert_user(email, name, role, hotel_code, password_plain: Optional[str], is
 
 def select_hotel_filter(hotels_df: pd.DataFrame) -> Optional[str]:
     u = st.session_state.get("user")
-    if u["role"] in ("Direktor","Techniker"):
+    labels = hotel_label_map(hotels_df)
+
+    if u["role"] in ("Direktor", "Techniker"):
         return u["hotel_code"]
+
     options = ["Alle"] + hotels_df["code"].tolist()
-    sel = st.selectbox("Hotel-Filter", options, index=0)
+    # show pretty labels
+    def fmt(x):
+        return "Alle" if x == "Alle" else labels.get(x, x)
+
+    sel = st.selectbox("Hotel-Filter", options, index=0, format_func=fmt)
     return None if sel == "Alle" else sel
 
 # ---------------------------
@@ -697,15 +719,14 @@ def attachments_list_ui(hotel_code: str, entity_type: str, entity_id: int):
         cols = st.columns([3,2,2,1,1])
         cols[0].write(f"📎 **{r['filename']}**")
         cols[1].write(r.get("uploaded_by") or "")
-        cols[2].write(r.get("uploaded_at")[:19].replace("T"," "))
-        # download
+        cols[2].write((r.get("uploaded_at") or "")[:19].replace("T"," "))
         try:
             with open(r["stored_path"], "rb") as f:
                 data = f.read()
-            cols[3].download_button("Download", data, file_name=r["filename"], mime=r.get("mime_type") or "application/octet-stream")
+            cols[3].download_button("Download", data, file_name=r["filename"],
+                                    mime=r.get("mime_type") or "application/octet-stream")
         except Exception:
             cols[3].write("—")
-        # delete
         if role_in("Admin") and cols[4].button("Löschen", key=f"del_att_{r['id']}"):
             delete_attachment(int(r["id"]))
             st.success("Anhang gelöscht.")
@@ -714,7 +735,21 @@ def attachments_list_ui(hotel_code: str, entity_type: str, entity_id: int):
 # ---------------------------
 # PDF Export (Audit Report)
 # ---------------------------
-def make_audit_pdf(audit: Dict, dfq: pd.DataFrame) -> bytes:
+def wrap_text(text: str, max_chars: int) -> List[str]:
+    words = (text or "").split()
+    lines = []
+    line = ""
+    for w in words:
+        if len(line) + len(w) + 1 <= max_chars:
+            line = (line + " " + w).strip()
+        else:
+            lines.append(line)
+            line = w
+    if line:
+        lines.append(line)
+    return lines or [""]
+
+def make_audit_pdf(audit: Dict, dfq: pd.DataFrame, hotel_name: str) -> bytes:
     buf = BytesIO()
     c = canvas.Canvas(buf, pagesize=A4)
     width, height = A4
@@ -733,7 +768,9 @@ def make_audit_pdf(audit: Dict, dfq: pd.DataFrame) -> bytes:
     c.drawString(20*mm, y, f"Audit: {audit.get('audit_code','')}")
     y -= 6*mm
     c.setFont("Helvetica", 10)
-    c.drawString(20*mm, y, f"Hotel: {audit.get('hotel_code','')}   Norm: {audit.get('norm','')}   Bereich: {audit.get('area','')}")
+    c.drawString(20*mm, y, f"Hotel: {audit.get('hotel_code','')} – {hotel_name}")
+    y -= 6*mm
+    c.drawString(20*mm, y, f"Norm: {audit.get('norm','')}   Bereich: {audit.get('area','')}")
     y -= 6*mm
     c.drawString(20*mm, y, f"Auditdatum: {fmt_date(parse_date(audit.get('audit_date')))}   Auditor: {audit.get('auditor_name') or ''}")
     y -= 6*mm
@@ -788,29 +825,12 @@ def make_audit_pdf(audit: Dict, dfq: pd.DataFrame) -> bytes:
     c.save()
     return buf.getvalue()
 
-def wrap_text(text: str, max_chars: int) -> List[str]:
-    words = (text or "").split()
-    lines = []
-    line = ""
-    for w in words:
-        if len(line) + len(w) + 1 <= max_chars:
-            line = (line + " " + w).strip()
-        else:
-            lines.append(line)
-            line = w
-    if line:
-        lines.append(line)
-    if not lines:
-        return [""]
-    return lines
-
 # ---------------------------
 # Notifications (Outlook via Graph, Teams via Webhook)
 # ---------------------------
 _graph_token_cache = {"token": None, "expires_at": 0}
 
 def graph_get_token() -> Optional[str]:
-    # Client Credentials token (app-only)
     if not (MS_TENANT_ID and MS_CLIENT_ID and MS_CLIENT_SECRET):
         return None
     now = int(datetime.utcnow().timestamp())
@@ -855,7 +875,6 @@ def graph_send_mail(to_emails: List[str], subject: str, html_body: str) -> bool:
 def teams_post_message(title: str, text: str) -> bool:
     if not TEAMS_WEBHOOK_URL:
         return False
-    # Simple MessageCard payload (works for Incoming Webhook)
     payload = {
         "@type": "MessageCard",
         "@context": "http://schema.org/extensions",
@@ -867,7 +886,7 @@ def teams_post_message(title: str, text: str) -> bool:
     r = requests.post(TEAMS_WEBHOOK_URL, json=payload, timeout=20)
     return r.status_code in (200, 201)
 
-def build_compliance_digest(hotel_code: Optional[str], warn_days: int) -> Dict:
+def compliance_digest(hotel_code: Optional[str], warn_days: int) -> Dict:
     df = compliance_df(hotel_code)
     td = today()
     items = []
@@ -890,7 +909,7 @@ def build_compliance_digest(hotel_code: Optional[str], warn_days: int) -> Dict:
     items.sort(key=lambda x: (severity_rank(x["status"]), x["days"], x["hotel"], x["asset"]))
     return {"items": items, "count": len(items)}
 
-def build_actions_digest(hotel_code: Optional[str]) -> Dict:
+def actions_digest(hotel_code: Optional[str]) -> Dict:
     df = list_actions(hotel_code)
     td = today()
     items = []
@@ -910,51 +929,55 @@ def build_actions_digest(hotel_code: Optional[str]) -> Dict:
                 "owner": r["owner_name"] or "",
                 "audit_code": r.get("audit_code") or ""
             })
-    # overdue first, then due date
     items.sort(key=lambda x: (0 if x["overdue"] else 1, x["due"] or date(2999,1,1)))
     return {"items": items, "count": len(items)}
 
 def send_digest(to_emails: List[str], hotel_filter: Optional[str], warn_days: int,
-                send_mail: bool, send_teams: bool) -> Dict[str, bool]:
-    comp = build_compliance_digest(hotel_filter, warn_days)
-    acts = build_actions_digest(hotel_filter)
+                send_mail: bool, send_teams: bool, hotels_df: pd.DataFrame) -> Dict[str, bool]:
+    labels = hotel_label_map(hotels_df)
+    comp = compliance_digest(hotel_filter, warn_days)
+    acts = actions_digest(hotel_filter)
 
     title = f"Audit/Compliance Digest – {fmt_date(today())}"
-    scope = f"Hotel: {hotel_filter}" if hotel_filter else "Alle Hotels"
-    base_link = f"<p><b>{scope}</b></p>" if send_mail else ""
-    link_hint = ""
-    if APP_BASE_URL:
-        link_hint = f"<p>App: <a href='{APP_BASE_URL}'>{APP_BASE_URL}</a></p>"
+    scope = "Alle Hotels" if not hotel_filter else labels.get(hotel_filter, hotel_filter)
+    link_hint = f"<p>App: <a href='{APP_BASE_URL}'>{APP_BASE_URL}</a></p>" if APP_BASE_URL else ""
 
-    # HTML for mail
     html = f"""
     <html><body>
     <h2>{title}</h2>
-    {base_link}
+    <p><b>{scope}</b></p>
     {link_hint}
     <h3>Betreiberpflichten (Überfällig/Fällig/Bald fällig): {comp['count']}</h3>
     <ul>
     """
     for it in comp["items"][:40]:
-        html += f"<li><b>{it['hotel']}</b> – {it['asset']} / {it['task']} – <b>{it['status']}</b> – {fmt_date(it['next'])} ({it['days']} Tage) {('– Owner: '+it['owner']) if it['owner'] else ''}</li>"
+        html += (
+            f"<li><b>{labels.get(it['hotel'], it['hotel'])}</b> – "
+            f"{it['asset']} / {it['task']} – <b>{it['status']}</b> – "
+            f"{fmt_date(it['next'])} ({it['days']} Tage) "
+            f"{('– Owner: '+it['owner']) if it['owner'] else ''}</li>"
+        )
     html += "</ul>"
     html += f"<h3>Offene Maßnahmen: {acts['count']}</h3><ul>"
     for it in acts["items"][:40]:
         due = fmt_date(it["due"])
         flag = "🚨" if it["overdue"] else "⏳"
-        html += f"<li>{flag} <b>{it['hotel']}</b> – [{it['category']}] {it['title']} – Frist: <b>{due}</b> – Status: {it['status']} {('– Owner: '+it['owner']) if it['owner'] else ''}</li>"
+        html += (
+            f"<li>{flag} <b>{labels.get(it['hotel'], it['hotel'])}</b> – "
+            f"[{it['category']}] {it['title']} – Frist: <b>{due}</b> – "
+            f"Status: {it['status']} {('– Owner: '+it['owner']) if it['owner'] else ''}</li>"
+        )
     html += "</ul></body></html>"
 
-    # Text for Teams
     t = f"**{title}**\n\n**{scope}**\n\n"
     t += f"**Betreiberpflichten fällig:** {comp['count']}\n"
     for it in comp["items"][:20]:
-        t += f"- **{it['hotel']}** {it['asset']} / {it['task']} → **{it['status']}** ({fmt_date(it['next'])}, {it['days']} Tage)\n"
+        t += f"- **{labels.get(it['hotel'], it['hotel'])}** {it['asset']} / {it['task']} → **{it['status']}** ({fmt_date(it['next'])}, {it['days']} Tage)\n"
     t += f"\n**Offene Maßnahmen:** {acts['count']}\n"
     for it in acts["items"][:20]:
         due = fmt_date(it["due"])
         flag = "🚨" if it["overdue"] else "⏳"
-        t += f"- {flag} **{it['hotel']}** [{it['category']}] {it['title']} → Frist **{due}**\n"
+        t += f"- {flag} **{labels.get(it['hotel'], it['hotel'])}** [{it['category']}] {it['title']} → Frist **{due}**\n"
     if APP_BASE_URL:
         t += f"\nApp: {APP_BASE_URL}"
 
@@ -993,14 +1016,17 @@ def login_ui():
         st.success(f"Eingeloggt als {u['name']} ({u['role']})")
         st.rerun()
 
-def header_ui():
+def header_ui(hotels_df: pd.DataFrame):
     u = st.session_state.get("user")
+    labels = hotel_label_map(hotels_df)
+
     cols = st.columns([3,2,1])
     with cols[0]:
         st.title(APP_TITLE)
     with cols[1]:
         if u:
-            st.caption(f"Angemeldet: **{u['name']}** · Rolle: **{u['role']}** · Hotel: **{u.get('hotel_code') or 'Alle'}**")
+            hotel_txt = "Alle" if not u.get("hotel_code") else labels.get(u["hotel_code"], u["hotel_code"])
+            st.caption(f"Angemeldet: **{u['name']}** · Rolle: **{u['role']}** · Hotel: **{hotel_txt}**")
     with cols[2]:
         if u and st.button("Logout"):
             st.session_state["user"] = None
@@ -1009,13 +1035,13 @@ def header_ui():
 # ---------------------------
 # Pages
 # ---------------------------
-def page_dashboard():
+def page_dashboard(hotels_df: pd.DataFrame):
     require_login()
-    hotels = get_hotels()
+    labels = hotel_label_map(hotels_df)
     st.subheader("Dashboard")
 
     warn_days = st.slider("Warnschwelle (Tage bis fällig)", min_value=7, max_value=90, value=30, step=1)
-    hotel_filter = select_hotel_filter(hotels)
+    hotel_filter = select_hotel_filter(hotels_df)
 
     statuses, total = compliance_kpis(hotel_filter, warn_days=warn_days)
     c1, c2, c3, c4, c5 = st.columns(5)
@@ -1041,12 +1067,12 @@ def page_dashboard():
 
     st.divider()
     st.markdown("### Top Betreiberpflichten (Überfällig/Fällig/Bald fällig)")
-    comp = build_compliance_digest(hotel_filter, warn_days)
+    comp = compliance_digest(hotel_filter, warn_days)
     if comp["count"] == 0:
         st.info("Keine fälligen/überfälligen Betreiberpflichten.")
     else:
         view = pd.DataFrame([{
-            "Hotel": it["hotel"],
+            "Hotel": labels.get(it["hotel"], it["hotel"]),
             "Anlage": it["asset"],
             "Aufgabe": it["task"],
             "Status": it["status"],
@@ -1064,7 +1090,7 @@ def page_dashboard():
         send_teams = st.checkbox("Teams Nachricht senden (Webhook)", value=bool(TEAMS_WEBHOOK_URL))
 
         default_to = st.session_state.get("digest_to", "")
-        to_emails = st.text_input("Empfänger (Komma-separiert)", value=default_to, help="z.B. direktor_h1@firma.de, direktor_h2@firma.de")
+        to_emails = st.text_input("Empfänger (Komma-separiert)", value=default_to)
         if st.button("Digest jetzt senden"):
             recipients = [e.strip() for e in to_emails.split(",") if e.strip()]
             st.session_state["digest_to"] = to_emails
@@ -1073,16 +1099,16 @@ def page_dashboard():
             elif send_mail and not recipients:
                 st.error("Bitte E-Mail Empfänger eintragen.")
             else:
-                res = send_digest(recipients, hotel_filter, warn_days, send_mail, send_teams)
+                res = send_digest(recipients, hotel_filter, warn_days, send_mail, send_teams, hotels_df)
                 st.success(f"Ergebnis: Mail={res['mail']} · Teams={res['teams']}")
 
-def page_betreiberpflichten():
+def page_betreiberpflichten(hotels_df: pd.DataFrame):
     require_login()
-    hotels = get_hotels()
+    labels = hotel_label_map(hotels_df)
     st.subheader("Betreiberpflichten / Prüfkalender")
 
     warn_days = st.slider("Warnschwelle (Tage bis fällig)", 7, 90, 30, 1, key="warn_ops")
-    hotel_filter = select_hotel_filter(hotels)
+    hotel_filter = select_hotel_filter(hotels_df)
 
     df = compliance_df(hotel_filter)
     td = today()
@@ -1094,7 +1120,7 @@ def page_betreiberpflichten():
         stt = status_from_days(days, warn_days=warn_days) if nd else "—"
         rows.append({
             "ID": r["id"],
-            "Hotel": r["hotel_code"],
+            "Hotel": labels.get(r["hotel_code"], r["hotel_code"]),
             "Anlage": r["asset"],
             "Aufgabe": r["task"],
             "Intervall (Monate)": r["interval_months"],
@@ -1121,10 +1147,11 @@ def page_betreiberpflichten():
 
     if sel_id == "Neu":
         with st.form("add_compliance"):
-            hc_opts = hotels["code"].tolist()
             if role_in("Direktor","Techniker"):
                 hc_opts = [st.session_state["user"]["hotel_code"]]
-            hc = st.selectbox("Hotel", hc_opts)
+            else:
+                hc_opts = hotels_df["code"].tolist()
+            hc = st.selectbox("Hotel", hc_opts, format_func=lambda x: labels.get(x, x))
             asset = st.text_input("Anlage", "")
             task = st.text_input("Prüfung/Wartung", "")
             interval = st.number_input("Intervall (Monate)", min_value=1, max_value=120, value=12, step=1)
@@ -1144,7 +1171,7 @@ def page_betreiberpflichten():
             st.error("Keine Berechtigung.")
             return
         with st.form("edit_compliance"):
-            st.write(f"**Hotel:** {r['hotel_code']} · **Anlage:** {r['asset']} · **Aufgabe:** {r['task']}")
+            st.write(f"**Hotel:** {labels.get(r['hotel_code'], r['hotel_code'])} · **Anlage:** {r['asset']} · **Aufgabe:** {r['task']}")
             interval = st.number_input("Intervall (Monate)", 1, 120, int(r["interval_months"]), 1)
             last = parse_date(r["last_date"])
             last_new = st.date_input("Letzte Prüfung", value=last or today())
@@ -1171,19 +1198,21 @@ def page_betreiberpflichten():
         upload_attachment_ui(r["hotel_code"], "compliance", int(sel_id))
         attachments_list_ui(r["hotel_code"], "compliance", int(sel_id))
 
-def page_audits():
+def page_audits(hotels_df: pd.DataFrame):
     require_login()
-    hotels = get_hotels()
+    labels = hotel_label_map(hotels_df)
+    code_to_name = {r["code"]: r["name"] for _, r in hotels_df.iterrows()}
     st.subheader("Audits")
 
-    hotel_filter = select_hotel_filter(hotels)
+    hotel_filter = select_hotel_filter(hotels_df)
 
     st.markdown("### Auditliste")
     dfa = list_audits(hotel_filter)
     if len(dfa):
         show = dfa.copy()
+        show["Hotel"] = show["hotel_code"].apply(lambda x: labels.get(x, x))
         show["Auditdatum"] = show["audit_date"].apply(lambda x: fmt_date(parse_date(x)))
-        show = show[["id","audit_code","hotel_code","norm","area","Auditdatum","status","score","auditor_name"]]
+        show = show[["id","audit_code","Hotel","norm","area","Auditdatum","status","score","auditor_name"]]
         st.dataframe(show, use_container_width=True, hide_index=True)
     else:
         st.info("Noch keine Audits vorhanden.")
@@ -1191,10 +1220,11 @@ def page_audits():
     st.divider()
     st.markdown("### Audit anlegen")
     with st.form("create_audit"):
-        hc_opts = hotels["code"].tolist()
         if role_in("Direktor","Techniker"):
             hc_opts = [st.session_state["user"]["hotel_code"]]
-        hc = st.selectbox("Hotel", hc_opts)
+        else:
+            hc_opts = hotels_df["code"].tolist()
+        hc = st.selectbox("Hotel", hc_opts, format_func=lambda x: labels.get(x, x))
         norm = st.selectbox("Norm", ["ISO 9001","ISO 14001","ISO 45001","ISO 50001"])
         area = st.text_input("Bereich/Prozess", "Technik")
         auditor = st.text_input("Auditor", st.session_state["user"]["name"])
@@ -1216,7 +1246,7 @@ def page_audits():
         sel_audit_id = st.selectbox(
             "Audit auswählen",
             options=audit_ids,
-            format_func=lambda i: f"{int(i)} – {dfa[dfa['id']==i].iloc[0]['audit_code']}"
+            format_func=lambda i: f"{int(i)} – {dfa[dfa['id']==i].iloc[0]['audit_code']} ({labels.get(dfa[dfa['id']==i].iloc[0]['hotel_code'], '')})"
         )
         audit = get_audit(int(sel_audit_id))
         if not can_access_hotel(audit["hotel_code"]):
@@ -1229,7 +1259,8 @@ def page_audits():
             c1, c2, c3 = st.columns(3)
             with c1:
                 st.write(f"**Audit:** {audit['audit_code']}")
-                st.write(f"**Hotel:** {audit['hotel_code']} · **Norm:** {audit['norm']}")
+                st.write(f"**Hotel:** {labels.get(audit['hotel_code'], audit['hotel_code'])}")
+                st.write(f"**Norm:** {audit['norm']}")
                 st.write(f"**Bereich:** {audit['area']}")
             with c2:
                 status = st.selectbox("Status", ["Geplant","In Durchführung","Abgeschlossen"],
@@ -1254,11 +1285,10 @@ def page_audits():
                 st.rerun()
 
             if colz.button("Auditbericht als PDF"):
-                # Make sure score up to date
                 recompute_audit_score(audit["id"])
                 audit = get_audit(int(sel_audit_id))
                 dfq = audit_questions_answers(audit["id"])
-                pdf_bytes = make_audit_pdf(audit, dfq)
+                pdf_bytes = make_audit_pdf(audit, dfq, code_to_name.get(audit["hotel_code"], ""))
                 st.download_button(
                     "PDF herunterladen",
                     pdf_bytes,
@@ -1306,16 +1336,15 @@ def page_audits():
         st.markdown("### Anhänge (Audit-Unterlagen)")
         upload_attachment_ui(audit["hotel_code"], "audit", int(audit["id"]))
         attachments_list_ui(audit["hotel_code"], "audit", int(audit["id"]))
-
     else:
         st.info("Lege zuerst ein Audit an.")
 
-def page_massnahmen():
+def page_massnahmen(hotels_df: pd.DataFrame):
     require_login()
-    hotels = get_hotels()
+    labels = hotel_label_map(hotels_df)
     st.subheader("Maßnahmen / Findings")
 
-    hotel_filter = select_hotel_filter(hotels)
+    hotel_filter = select_hotel_filter(hotels_df)
     df = list_actions(hotel_filter)
 
     td = today()
@@ -1337,9 +1366,10 @@ def page_massnahmen():
     st.markdown("### Liste")
     if len(df):
         show = df.copy()
+        show["Hotel"] = show["hotel_code"].apply(lambda x: labels.get(x, x))
         show["Frist"] = show["due_date"].apply(lambda x: fmt_date(parse_date(x)))
         show["Wirksamkeit"] = show["effectiveness_date"].apply(lambda x: fmt_date(parse_date(x)))
-        show = show[["id","hotel_code","audit_code","category","title","owner_name","Frist","status","Wirksamkeit","notes"]]
+        show = show[["id","Hotel","audit_code","category","title","owner_name","Frist","status","Wirksamkeit","notes"]]
         st.dataframe(show, use_container_width=True, hide_index=True)
         st.download_button("CSV export", show.to_csv(index=False).encode("utf-8"), "massnahmen.csv", "text/csv")
     else:
@@ -1352,10 +1382,11 @@ def page_massnahmen():
 
     if sel == "Neu":
         with st.form("create_action_form"):
-            hc_opts = hotels["code"].tolist()
             if role_in("Direktor","Techniker"):
                 hc_opts = [st.session_state["user"]["hotel_code"]]
-            hc = st.selectbox("Hotel", hc_opts)
+            else:
+                hc_opts = hotels_df["code"].tolist()
+            hc = st.selectbox("Hotel", hc_opts, format_func=lambda x: labels.get(x, x))
 
             audits = list_audits(hc)
             audit_map = {"—": None}
@@ -1386,7 +1417,7 @@ def page_massnahmen():
             return
 
         with st.form("edit_action_form"):
-            st.write(f"**Hotel:** {row['hotel_code']} · **Audit:** {row.get('audit_code') or '—'}")
+            st.write(f"**Hotel:** {labels.get(row['hotel_code'], row['hotel_code'])} · **Audit:** {row.get('audit_code') or '—'}")
             title = st.text_input("Titel", value=row["title"] or "")
             category = st.selectbox("Kategorie", ["Major","Minor","Beobachtung","Verbesserung"],
                                    index=["Major","Minor","Beobachtung","Verbesserung"].index(row["category"]))
@@ -1420,23 +1451,23 @@ def page_massnahmen():
         upload_attachment_ui(row["hotel_code"], "action", int(sel))
         attachments_list_ui(row["hotel_code"], "action", int(sel))
 
-def page_admin():
+def page_admin(hotels_df: pd.DataFrame):
     require_login()
     if not role_in("Admin"):
         st.error("Nur Admin.")
         return
 
+    labels = hotel_label_map(hotels_df)
     st.subheader("Admin")
     tab1, tab2, tab3, tab4 = st.tabs(["Hotels", "User", "Auditfragen", "Integrationen"])
 
     with tab1:
         st.markdown("### Hotels")
-        hotels = get_hotels()
-        st.dataframe(hotels, use_container_width=True, hide_index=True)
+        st.dataframe(hotels_df, use_container_width=True, hide_index=True)
 
         st.markdown("#### Hotel bearbeiten")
-        hc = st.selectbox("Hotel", hotels["code"].tolist(), key="adm_hotel_sel")
-        row = hotels[hotels["code"]==hc].iloc[0].to_dict()
+        hc = st.selectbox("Hotel", hotels_df["code"].tolist(), format_func=lambda x: labels.get(x, x), key="adm_hotel_sel")
+        row = hotels_df[hotels_df["code"]==hc].iloc[0].to_dict()
         with st.form("edit_hotel"):
             name = st.text_input("Name", value=row["name"])
             city = st.text_input("Stadt", value=row.get("city") or "")
@@ -1460,16 +1491,19 @@ def page_admin():
     with tab2:
         st.markdown("### User")
         users = list_users()
-        st.dataframe(users, use_container_width=True, hide_index=True)
+        users_show = users.copy()
+        users_show["Hotel"] = users_show["hotel_code"].apply(lambda x: labels.get(x, "") if x else "")
+        users_show = users_show.drop(columns=["hotel_code"])
+        st.dataframe(users_show, use_container_width=True, hide_index=True)
 
         st.markdown("#### User anlegen/ändern")
-        hotels = get_hotels()
-        hc_opts = ["—"] + hotels["code"].tolist()
+        hc_opts = ["—"] + hotels_df["code"].tolist()
         with st.form("upsert_user_form"):
             email = st.text_input("E-Mail", "")
             name = st.text_input("Name", "")
             role = st.selectbox("Rolle", ["Admin","Direktor","Techniker","Auditor"])
-            hotel_code = st.selectbox("Hotel (für Direktor/Techniker)", hc_opts)
+            hotel_code = st.selectbox("Hotel (für Direktor/Techniker)", hc_opts,
+                                      format_func=lambda x: "—" if x == "—" else labels.get(x, x))
             pw = st.text_input("Neues Passwort (leer = nicht ändern)", type="password")
             active = st.checkbox("Aktiv", value=True)
             ok = st.form_submit_button("Speichern")
@@ -1514,7 +1548,7 @@ def page_admin():
         st.markdown("### Integrationen (Outlook / Teams)")
         st.write("**Teams Webhook aktiv:**", bool(TEAMS_WEBHOOK_URL))
         st.write("**Microsoft Graph aktiv:**", bool(MS_TENANT_ID and MS_CLIENT_ID and MS_CLIENT_SECRET and MAIL_SENDER_UPN))
-        st.caption("Für Outlook/Graph brauchst du eine Azure App Registration (Client Credentials) + Mail.Send Berechtigung (Application).")
+        st.caption("Für Outlook/Graph brauchst du eine Azure App Registration (Client Credentials) + Mail.Send (Application) + Admin Consent.")
         st.caption("Für Teams reicht ein Incoming Webhook im gewünschten Channel.")
 
 # ---------------------------
@@ -1526,7 +1560,8 @@ def main():
     seed_if_empty()
     compute_and_store_next_dates()
 
-    header_ui()
+    hotels_df = get_hotels()
+    header_ui(hotels_df)
 
     if "user" not in st.session_state or not st.session_state["user"]:
         st.warning("Nicht eingeloggt.")
@@ -1535,18 +1570,17 @@ def main():
         return
 
     pages = {
-        "Dashboard": page_dashboard,
-        "Betreiberpflichten": page_betreiberpflichten,
-        "Audits": page_audits,
-        "Maßnahmen": page_massnahmen,
+        "Dashboard": lambda: page_dashboard(hotels_df),
+        "Betreiberpflichten": lambda: page_betreiberpflichten(hotels_df),
+        "Audits": lambda: page_audits(hotels_df),
+        "Maßnahmen": lambda: page_massnahmen(hotels_df),
     }
     if role_in("Admin"):
-        pages["Admin"] = page_admin
+        pages["Admin"] = lambda: page_admin(hotels_df)
 
     st.sidebar.radio("Navigation", list(pages.keys()), key="nav")
     choice = st.session_state["nav"]
     st.sidebar.caption("Direktor/Techniker sehen automatisch nur das eigene Hotel.")
-
     pages[choice]()
 
 if __name__ == "__main__":

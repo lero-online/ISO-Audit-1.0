@@ -250,12 +250,12 @@ def seed_if_empty():
     if cur.fetchone()["c"] == 0:
         now = utc_now_iso()
         hotels = [
-            ("H1","Hotel 1","",None,None,"","",now),
-            ("H2","Hotel 2","",None,None,"","",now),
-            ("H3","Hotel 3","",None,None,"","",now),
-            ("H4","Hotel 4","",None,None,"","",now),
-            ("H5","Hotel 5","",None,None,"","",now),
-        ]
+    ("6502","Hotel München City Center Affiliated by Melia","München",None,None,"","",now),
+    ("6513","Hotel Frankfurt Messe Affiliated by Melia","Frankfurt",None,None,"","",now),
+    ("6527","INNSiDE by Meliá München Parkstadt Schwabing","München",None,None,"","",now),
+    ("6551","INNSiDE by Meliá Frankfurt Ostend","Frankfurt",None,None,"","",now),
+    ("6595","Melia Frankfurt City","Frankfurt",None,None,"","",now),
+]
         cur.executemany("""
             INSERT INTO hotels(code,name,city,rooms,sqm,director_name,technician_name,created_at)
             VALUES (?,?,?,?,?,?,?,?)

@@ -1,19 +1,14 @@
 # app.py
 # Umfangreiche Streamlit Web-App: Audit + Betreiberpflichten + Dashboard + Uploads + PDF + Outlook/Teams Notifications
 #
-# ✅ Angepasst auf deine 5 Hotels (Codes 6502/6513/6527/6551/6595)
-# ✅ UI zeigt überall "CODE – HOTELNAME" statt H1–H5
-# ✅ Direktor/Techniker sehen automatisch nur ihr eigenes Hotel (über hotel_code)
+# ✅ 5 Hotels (Codes 6502/6513/6527/6551/6595)
+# ✅ Hotelanzeige überall: "CODE – NAME"
+# ✅ Direktor/Techniker sehen automatisch nur ihr eigenes Hotel
 #
-# Outlook (Graph) via Client Credentials:
-#   MS_TENANT_ID, MS_CLIENT_ID, MS_CLIENT_SECRET
-#   MAIL_SENDER_UPN   (Mailbox/User, in dessen Kontext gesendet werden darf)
-#
-# Teams via Incoming Webhook:
-#   TEAMS_WEBHOOK_URL
-#
-# Optional:
-#   APP_BASE_URL (z.B. https://deine-app.streamlit.app) für Links in Notifications
+# ✅ Auditfragen TÜV-artig: Clause/Subclause + Evidence-Hints + detaillierter ISO 50001 Katalog
+# ✅ Migration: audit_questions bekommt clause/evidence_hint automatisch (ohne DB löschen)
+# ✅ Admin-Button: ISO 50001 Katalog importieren/aktualisieren
+# ✅ Bestehende Audits: fehlende Antwortzeilen werden automatisch ergänzt
 #
 # Start:
 #   pip install -r requirements.txt
@@ -23,7 +18,7 @@ import os
 import sqlite3
 import hashlib
 from datetime import datetime, date, timedelta
-from typing import Optional, Dict, List
+from typing import Optional, Dict, List, Tuple
 from io import BytesIO
 
 import pandas as pd
@@ -56,6 +51,7 @@ MAIL_SENDER_UPN = os.environ.get("MAIL_SENDER_UPN")
 
 # Teams
 TEAMS_WEBHOOK_URL = os.environ.get("TEAMS_WEBHOOK_URL")
+
 
 # ---------------------------
 # Helpers
@@ -130,6 +126,7 @@ def safe_filename(name: str) -> str:
     name = name.replace("\\", "_").replace("/", "_")
     return "".join(c for c in name if c.isalnum() or c in (" ", ".", "_", "-", "(", ")")).strip()
 
+
 # ---------------------------
 # DB
 # ---------------------------
@@ -199,11 +196,14 @@ def init_db():
         FOREIGN KEY (hotel_code) REFERENCES hotels(code) ON DELETE CASCADE
     );
 
+    -- audit_questions upgraded: clause + evidence_hint
     CREATE TABLE IF NOT EXISTS audit_questions (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         norm TEXT NOT NULL,
         chapter TEXT NOT NULL,
+        clause TEXT,
         question TEXT NOT NULL,
+        evidence_hint TEXT,
         is_active INTEGER NOT NULL DEFAULT 1
     );
 
@@ -254,6 +254,22 @@ def init_db():
     conn.commit()
     conn.close()
 
+def migrate_db():
+    """Adds missing columns to existing DB without data loss (if user had older version)."""
+    conn = db()
+    cur = conn.cursor()
+
+    # audit_questions might exist without clause/evidence_hint in older DB
+    cur.execute("PRAGMA table_info(audit_questions)")
+    cols = {row[1] for row in cur.fetchall()}
+    if "clause" not in cols:
+        cur.execute("ALTER TABLE audit_questions ADD COLUMN clause TEXT")
+    if "evidence_hint" not in cols:
+        cur.execute("ALTER TABLE audit_questions ADD COLUMN evidence_hint TEXT")
+
+    conn.commit()
+    conn.close()
+
 def seed_if_empty():
     conn = db()
     cur = conn.cursor()
@@ -285,47 +301,7 @@ def seed_if_empty():
                 VALUES (?,?,?,?,?,?,?)
             """, (f"direktor_{hc}@local", f"Direktor {hc} – {hname}", sha256("director123"), "Direktor", hc, 1, now))
 
-    # Audit questions
-    cur.execute("SELECT COUNT(*) c FROM audit_questions")
-    if cur.fetchone()["c"] == 0:
-        questions = []
-        questions += [
-            ("ISO 9001","4","Sind Kontext und interessierte Parteien bestimmt und dokumentiert?"),
-            ("ISO 9001","5","Sind Rollen/Verantwortlichkeiten und Qualitäts-Politik festgelegt?"),
-            ("ISO 9001","6","Sind Risiken/Chancen bewertet und Qualitätsziele geplant?"),
-            ("ISO 9001","7","Sind Kompetenzen/Schulungen nachweisbar und Dokumente gelenkt?"),
-            ("ISO 9001","8","Sind Prozesse definiert, umgesetzt und überwacht (inkl. Outsourcing)?"),
-            ("ISO 9001","9","Werden Kennzahlen geprüft und Managementbewertungen durchgeführt?"),
-            ("ISO 9001","10","Werden Abweichungen, Korrekturmaßnahmen und KVP wirksam umgesetzt?"),
-        ]
-        questions += [
-            ("ISO 50001","4","Ist der EnMS-Geltungsbereich definiert und Kontext/Stakeholder bewertet?"),
-            ("ISO 50001","5","Energiepolitik, Rollen und Top-Management-Commitment vorhanden?"),
-            ("ISO 50001","6","Energetische Bewertung: SEU, EnPI und Baseline festgelegt?"),
-            ("ISO 50001","6","Energieziele & Aktionspläne: Zuständigkeiten, Termine, Monitoring?"),
-            ("ISO 50001","8","Betriebliche Steuerung: Betrieb/Wartung/Beschaffung energiebezogen geregelt?"),
-            ("ISO 50001","9","Messkonzept & Datenqualität: EnPI-Überwachung, Analyse, interne Audits?"),
-            ("ISO 50001","10","Korrekturmaßnahmen & kontinuierliche Verbesserung nachweisbar?"),
-        ]
-        questions += [
-            ("ISO 14001","4","Kontext/Stakeholder & Geltungsbereich des UMS definiert?"),
-            ("ISO 14001","6","Umweltaspekte & bindende Verpflichtungen identifiziert und bewertet?"),
-            ("ISO 14001","6","Umweltziele & Programme mit Verantwortlichkeiten/Terminen?"),
-            ("ISO 14001","8","Betriebliche Steuerung inkl. Notfallvorsorge/Reaktion umgesetzt?"),
-            ("ISO 14001","9","Überwachung/Messung, Compliance-Bewertung und Managementreview?"),
-            ("ISO 14001","10","Nichtkonformitäten & Korrekturmaßnahmen wirksam?"),
-        ]
-        questions += [
-            ("ISO 45001","4","Kontext/Stakeholder & SGA-Geltungsbereich definiert?"),
-            ("ISO 45001","5","Rollen/Verantwortlichkeiten, Beteiligung/Konsultation geregelt?"),
-            ("ISO 45001","6","Gefährdungsbeurteilung, Risiken/Chancen & Rechtsanforderungen umgesetzt?"),
-            ("ISO 45001","8","Operative Steuerung: Maßnahmen, Unterweisungen, Fremdfirmen?"),
-            ("ISO 45001","9","Leistungsbewertung, interne Audits und Managementreview?"),
-            ("ISO 45001","10","Vorfallmanagement, Korrekturmaßnahmen, kontinuierliche Verbesserung?"),
-        ]
-        cur.executemany("INSERT INTO audit_questions(norm,chapter,question,is_active) VALUES (?,?,?,1)", questions)
-
-    # Compliance seed items
+    # Compliance seed
     cur.execute("SELECT COUNT(*) c FROM compliance_items")
     if cur.fetchone()["c"] == 0:
         now = utc_now_iso()
@@ -350,6 +326,15 @@ def seed_if_empty():
             VALUES (?,?,?,?,?,?,?,?,?,?)
         """, rows)
 
+    # Audit questions seed ONLY if empty
+    cur.execute("SELECT COUNT(*) c FROM audit_questions")
+    if cur.fetchone()["c"] == 0:
+        all_questions = build_default_questions()
+        cur.executemany("""
+            INSERT INTO audit_questions(norm,chapter,clause,question,evidence_hint,is_active)
+            VALUES (?,?,?,?,?,1)
+        """, all_questions)
+
     conn.commit()
     conn.close()
 
@@ -367,6 +352,154 @@ def compute_and_store_next_dates():
     conn.commit()
     conn.close()
 
+
+# ---------------------------
+# Questions Catalog (TÜV-like style, but newly authored)
+# ---------------------------
+def build_questions_50001_detailed() -> List[Tuple[str, str, str, str, str]]:
+    q = []
+    def add(chapter: str, clause: str, question: str, hint: str):
+        q.append(("ISO 50001", chapter, clause, question, hint))
+
+    # 4 Context
+    add("4", "4.1", "Ist der Kontext der Organisation (interne/externe Themen) in Bezug auf Energie und EnMS dokumentiert, plausibel und aktuell?",
+        "Nachweis: Kontextanalyse, Energie-/Klimarisiken, Markt-/Preisrisiken, technische Randbedingungen, letzte Aktualisierung.")
+    add("4", "4.2", "Sind interessierte Parteien (Eigentümer, Pächter, Behörden, Gäste, Lieferanten, FM) und deren Anforderungen energiebezogen ermittelt und bewertet?",
+        "Nachweis: Stakeholderliste, Anforderungen, Compliance-Pflichten, Bewertung/Überwachung, Reportinganforderungen HQ.")
+    add("4", "4.3", "Ist der Geltungsbereich des EnMS eindeutig definiert (Standorte/Hotels, Energiearten, Prozesse/Anlagen) inkl. Abgrenzungen/Begründungen?",
+        "Nachweis: Scope-Dokument, Abgrenzung Out-of-scope, Outsourcing/Fremdfirmen-Schnittstellen.")
+    add("4", "4.4", "Sind EnMS-Prozesse inkl. Wechselwirkungen, Verantwortlichkeiten, Inputs/Outputs und erforderlicher Dokumentation beschrieben?",
+        "Nachweis: Prozesslandkarte, Verfahren, RACI, Schnittstellen (Hotel/OC/Externe), Dokumentenliste.")
+
+    # 5 Leadership
+    add("5", "5.1", "Ist das Top-Management-Commitment nachweisbar (Ziele, Ressourcen, Reviews, Wirksamkeit) und wird es aktiv gelebt?",
+        "Nachweis: Managementreview-Protokolle, Ressourcenfreigaben, Zielvorgaben, Entscheidungen, Eskalationen.")
+    add("5", "5.2", "Gibt es eine Energiepolitik, die geeignet ist, Energieperformance zu verbessern und bindende Verpflichtungen zu berücksichtigen?",
+        "Nachweis: Energiepolitik, Veröffentlichung (Intranet/Aushang), Kommunikation, Version/Freigabe.")
+    add("5", "5.3", "Sind Rollen/Verantwortlichkeiten/Kompetenzen (Energie-Team, Standortverantwortliche) dokumentiert, verstanden und wirksam?",
+        "Nachweis: Rollenbeschreibung, Stellvertretung, Aufgabenpaket, Interview-Stichprobe (Direktor/Technik/Einkauf).")
+
+    # 6 Planning
+    add("6", "6.1.1", "Sind Risiken & Chancen bezogen auf Energieperformance/EnMS identifiziert, bewertet und in Maßnahmen überführt?",
+        "Nachweis: Risiko-/Chancenliste, Priorisierung, Maßnahmenplan, Verantwortliche/Termine.")
+    add("6", "6.1.2", "Sind bindende Verpflichtungen energiebezogen (gesetzlich/vertraglich) identifiziert, aktualisiert und bewertet?",
+        "Nachweis: Rechtskataster, Vertragsauszüge, Betreiberpflichten, Nachverfolgung Änderungen.")
+    add("6", "6.2", "Sind Energieziele messbar (SMART), konsistent mit Energiepolitik, und mit Monitoring/Verantwortlichkeiten hinterlegt?",
+        "Nachweis: Zielmatrix, KPI/EnPI-Zuordnung, Verantwortliche, Fristen, Zielerreichungsgrad.")
+    add("6", "6.3", "Wurde eine energetische Bewertung durchgeführt (Energiearten, Verbräuche, Verbraucher, Lastprofile) und ist sie nachvollziehbar?",
+        "Nachweis: Energiebilanz, Medien (Strom/Gas/Fernwärme/Kälte), Top-Verbraucher, Lastgänge.")
+    add("6", "6.3", "Sind SEU (significant energy uses) identifiziert, begründet und werden Änderungen (Umbau, Belegung, Anlagenwechsel) berücksichtigt?",
+        "Nachweis: SEU-Liste, Kriterien, Aktualisierungsprozess, Change-Trigger, letzte Aktualisierung.")
+    add("6", "6.4", "Sind EnPI (Energy Performance Indicators) passend definiert (z.B. kWh/Übernachtung, kWh/m², witterungs-/belegungsbereinigt)?",
+        "Nachweis: EnPI-Definition, Datenquellen, Berechnungslogik, Verantwortliche, Normalisierung.")
+    add("6", "6.5", "Ist die Energiebaseline (EnB) festgelegt inkl. Regeln zur Anpassung bei wesentlichen Änderungen?",
+        "Nachweis: Baseline Zeitraum, Normalisierung (Wetter/Belegung), Anpassungsregeln, Dokumentation.")
+    add("6", "6.6", "Gibt es Aktionspläne mit Maßnahmen, Budget, Verantwortlichen, Terminen, erwarteter Einsparung und Verifikationsmethode?",
+        "Nachweis: Maßnahmenplan, Business Cases, CAPEX/OPEX, Einsparschätzung, M&V-Plan, Status.")
+
+    # 7 Support
+    add("7", "7.1", "Sind Ressourcen (Personal, Zeit, Budget, Messmittel) für EnMS geplant und ausreichend?",
+        "Nachweis: Ressourcenplanung, Budgetfreigaben, Messkonzept, Verantwortliche.")
+    add("7", "7.2", "Sind Kompetenzanforderungen für relevante Rollen festgelegt und werden Qualifikationen/Schulungen nachgewiesen?",
+        "Nachweis: Stellen-/Rollenprofile, Schulungsplan, Nachweise, Unterweisungen.")
+    add("7", "7.3", "Ist Bewusstsein vorhanden (Energiepolitik, Ziele, Einfluss der eigenen Arbeit) und wird es überprüft?",
+        "Nachweis: Kommunikation, Aushänge, Team-Meetings, Interview-Stichprobe, Awareness-Kampagnen.")
+    add("7", "7.4", "Ist Kommunikation intern/extern geregelt (wer/was/wann/wie) inkl. Reporting an zentrale Stellen?",
+        "Nachweis: Kommunikationsplan, Reportingzyklen, Eskalationswege, Empfängerlisten.")
+    add("7", "7.5", "Ist dokumentierte Information gelenkt (Freigabe, Version, Zugriff, Aufbewahrung, Archivierung)?",
+        "Nachweis: Dokumentenlenkung, Vorlagen, Änderungsdienst, Zugriffsrechte, Archiv.")
+
+    # 8 Operation
+    add("8", "8.1", "Sind operative Kriterien/Steuerungen für SEU definiert (z.B. BMS-Setpoints, Laufzeiten, SOP) und werden sie eingehalten?",
+        "Nachweis: SOP/Arbeitsanweisungen, BMS-Parameter, Änderungsprotokolle, Stichprobe (z.B. Setpoints).")
+    add("8", "8.1", "Werden betriebliche Abweichungen erkannt und gesteuert (Alarme, ungewöhnliche Lastgänge, Fehlfunktionen)?",
+        "Nachweis: Alarmmanagement, Tickets, RCA, Korrekturmaßnahmen, Trendanalysen.")
+    add("8", "8.2", "Wird energiebezogene Auslegung/Design bei Projekten/Retrofits berücksichtigt (z.B. Effizienz, Regelung, M&V)?",
+        "Nachweis: Projektchecklisten, Energieanforderungen, Abnahmen, Inbetriebnahmeprotokolle.")
+    add("8", "8.3", "Ist energiebezogene Beschaffung geregelt (Effizienzanforderungen an Geräte/Dienstleistungen; Lebenszykluskosten)?",
+        "Nachweis: Einkaufsrichtlinie, Spezifikationen, Angebotsvergleiche, LCC/ROI Betrachtung.")
+    add("8", "8.3", "Werden energierelevante Lieferanten/Dienstleister (FM, Wartung, Betreiber) gesteuert und bewertet?",
+        "Nachweis: SLAs/Verträge, Leistungsbeschreibungen, Kontrollen, KPI, Abnahmen, Fremdfirmenkoordination.")
+
+    # 9 Performance evaluation
+    add("9", "9.1.1", "Gibt es ein Mess- und Monitoringkonzept (Zählerstruktur, Datenpunkte, Frequenz, Verantwortliche) und ist es umgesetzt?",
+        "Nachweis: Messstellenplan, Zählerliste, BMS/Logger, Frequenz, Verantwortliche, Lückenanalyse.")
+    add("9", "9.1.1", "Sind Datenqualität und Plausibilisierung geregelt (Ausreißer, fehlende Werte, Korrekturen) und wird das gelebt?",
+        "Nachweis: Plausibilitätsregeln, Korrekturprotokolle, Datenvalidierung, Beispiel-Ausreißer.")
+    add("9", "9.1.2", "Wird Energieperformance anhand EnPI/EnB regelmäßig analysiert, bewertet und berichtet?",
+        "Nachweis: Monatsreports, Abweichungsanalysen, Maßnahmenableitung, Management-Reporting.")
+    add("9", "9.1.2", "Werden signifikante Abweichungen systematisch untersucht und Ursachenanalysen dokumentiert?",
+        "Nachweis: RCA (5Why/Ishikawa), Tickets, Maßnahmen, Wirksamkeitskontrolle.")
+    add("9", "9.2", "Sind interne Audits geplant und durchgeführt (Programm, Kriterien, Unabhängigkeit, Berichte, Maßnahmen)?",
+        "Nachweis: Auditprogramm, Auditorenqualifikation, Auditberichte, Maßnahmenverfolgung.")
+    add("9", "9.3", "Findet Managementbewertung statt (Inputs/Outputs gemäß Norm), inkl. Entscheidungen und Ressourcen?",
+        "Nachweis: Managementreview-Protokoll, Beschlüsse, Ressourcen, Ziel-/EnPI-Anpassungen.")
+
+    # 10 Improvement
+    add("10", "10.1", "Werden Nichtkonformitäten systematisch behandelt (Sofortmaßnahme, Ursache, Korrektur, Wirksamkeit) und dokumentiert?",
+        "Nachweis: NCR/CAPA, RCA, Wirksamkeitsprüfung, Lessons learned.")
+    add("10", "10.2", "Werden Korrekturmaßnahmen terminiert, nachverfolgt, eskaliert und abgeschlossen (Owner/Frist/Status)?",
+        "Nachweis: Maßnahmenliste, Status, Overdue-Management, Nachweise der Umsetzung.")
+    add("10", "10.3", "Ist kontinuierliche Verbesserung der Energieperformance nachweisbar (nicht nur EnMS-Dokumentation)?",
+        "Nachweis: Trendberichte, Einsparnachweise, Projekte, Kennzahlenentwicklung, verifizierte Einsparungen.")
+
+    # Praxis-Add-ons (Hotel)
+    add("6", "6.3 (Hotel)", "Sind die größten Verbraucher im Hotel identifiziert und quantifiziert (HVAC, Warmwasser, Küche, Wäscherei etc.)?",
+        "Nachweis: Top-Verbraucher-Liste, kWh-Anteile, Messwerte oder nachvollziehbare Schätzmethodik.")
+    add("8", "8.1 (Hotel)", "Sind Setpoints/Zeitschaltprogramme dokumentiert und gegen Komfort-/Betriebsanforderungen optimiert?",
+        "Nachweis: BMS-Screenshots, Änderungsprotokolle, Freigaben, Auswertung Gäste-Komfort vs. Verbrauch.")
+    add("8", "8.1 (Hotel)", "Gibt es Wartungs-/Instandhaltungspläne, die Energieperformance berücksichtigen (Filter, Wärmetauscher, Leckagen)?",
+        "Nachweis: Wartungsplan, Nachweise, bekannte Energie-Fehlerbilder, Abweichungsbehandlung.")
+    add("7", "7.2 (Hotel)", "Sind Dienstleister (Kälte/BMS/HLS) auf energiebezogene Anforderungen gebrieft/geschult (SOP, Setpoints, Effizienz)?",
+        "Nachweis: Einweisungen, Vertragsklauseln, Protokolle, stichprobenhafte Abfrage.")
+    add("9", "9.1.1 (Hotel)", "Sind Zähler/Unterzähler so gesetzt, dass SEU separat bewertet werden können (Submetering)?",
+        "Nachweis: Zählerkonzept, identifizierte Lücken, Plan/Projekt für zusätzliche Zähler.")
+    add("6", "6.6 (Hotel)", "Sind Einsparpotenziale bewertet und priorisiert (Quick Wins vs. CAPEX) nach ROI/CO₂/Komfort?",
+        "Nachweis: Maßnahmenportfolio, Priorisierungsmatrix, Business Cases, Umsetzung/Status.")
+    return q
+
+def build_default_questions() -> List[Tuple[str, str, Optional[str], str, str]]:
+    # Minimal für andere Normen + detaillierter ISO 50001 Katalog
+    def add(norm: str, chapter: str, clause: Optional[str], question: str, hint: str):
+        return (norm, chapter, clause, question, hint)
+
+    questions: List[Tuple[str, str, Optional[str], str, str]] = []
+
+    # ISO 9001 (kurz, aber mit Evidence-Hints – kann später ebenfalls detailliert werden)
+    questions += [
+        add("ISO 9001","4","4.1","Sind Kontext und interessierte Parteien bestimmt und dokumentiert?",
+            "Nachweis: Kontextanalyse, Stakeholderliste, Scope, Prozessübersicht."),
+        add("ISO 9001","5","5.1","Sind Rollen/Verantwortlichkeiten und Qualitäts-Politik festgelegt und kommuniziert?",
+            "Nachweis: Politik, Organigramm, Verantwortlichkeiten, Kommunikation."),
+        add("ISO 9001","6","6.1","Sind Risiken/Chancen bewertet und Qualitätsziele geplant?",
+            "Nachweis: Risiko-/Chancenliste, Zielmatrix, Maßnahmenplan."),
+        add("ISO 9001","7","7.2","Sind Kompetenzen/Schulungen nachweisbar und Dokumente gelenkt?",
+            "Nachweis: Schulungsnachweise, Dokumentenlenkung, Versionsstände."),
+        add("ISO 9001","8","8.1","Sind Prozesse definiert, umgesetzt und überwacht (inkl. Outsourcing)?",
+            "Nachweis: Prozessbeschreibungen, KPIs, Lieferantensteuerung."),
+        add("ISO 9001","9","9.1","Werden Kennzahlen geprüft und Managementbewertungen durchgeführt?",
+            "Nachweis: KPI-Reports, Managementreview-Protokolle."),
+        add("ISO 9001","10","10.2","Werden Abweichungen, Korrekturmaßnahmen und KVP wirksam umgesetzt?",
+            "Nachweis: NCR/CAPA, Ursachenanalyse, Wirksamkeitsprüfung."),
+    ]
+
+    # ISO 14001 / 45001 (kurz)
+    questions += [
+        add("ISO 14001","6","6.1.2","Sind Umweltaspekte und bindende Verpflichtungen identifiziert und bewertet?",
+            "Nachweis: Umweltaspektebewertung, Rechtskataster, Maßnahmen."),
+        add("ISO 14001","8","8.1","Ist operative Steuerung inkl. Notfallvorsorge/Reaktion umgesetzt?",
+            "Nachweis: Verfahren, Notfallpläne, Übungen, Nachweise."),
+        add("ISO 45001","6","6.1.2","Ist die Gefährdungsbeurteilung inkl. Maßnahmen umgesetzt und aktuell?",
+            "Nachweis: GBUs, Maßnahmenplan, Wirksamkeit, Unterweisungen."),
+        add("ISO 45001","8","8.1","Werden operative Maßnahmen inkl. Fremdfirmensteuerung umgesetzt?",
+            "Nachweis: Fremdfirmenprozess, Unterweisungen, Kontrollen, Dokumentation."),
+    ]
+
+    # ISO 50001 (detailliert)
+    questions += build_questions_50001_detailed()
+    return questions
+
+
 # ---------------------------
 # Data Access
 # ---------------------------
@@ -377,7 +510,6 @@ def get_hotels() -> pd.DataFrame:
     return df
 
 def hotel_label_map(hotels_df: pd.DataFrame) -> Dict[str, str]:
-    # code -> "code – name"
     return {r["code"]: f"{r['code']} – {r['name']}" for _, r in hotels_df.iterrows()}
 
 def get_user_by_email(email: str):
@@ -425,12 +557,12 @@ def select_hotel_filter(hotels_df: pd.DataFrame) -> Optional[str]:
         return u["hotel_code"]
 
     options = ["Alle"] + hotels_df["code"].tolist()
-    # show pretty labels
     def fmt(x):
         return "Alle" if x == "Alle" else labels.get(x, x)
 
     sel = st.selectbox("Hotel-Filter", options, index=0, format_func=fmt)
     return None if sel == "Alle" else sel
+
 
 # ---------------------------
 # Compliance
@@ -498,6 +630,7 @@ def delete_compliance_item(item_id: int):
     conn.commit()
     conn.close()
 
+
 # ---------------------------
 # Audits
 # ---------------------------
@@ -523,6 +656,23 @@ def list_audits(hotel_code: Optional[str]=None) -> pd.DataFrame:
     conn.close()
     return df
 
+def ensure_audit_answers(audit_id: int, norm: str):
+    """If new questions were added after audit creation, ensure answer rows exist."""
+    conn = db()
+    cur = conn.cursor()
+    now = utc_now_iso()
+
+    cur.execute("SELECT id FROM audit_questions WHERE norm=? AND is_active=1", (norm,))
+    qids = [row["id"] for row in cur.fetchall()]
+    for qid in qids:
+        cur.execute("""
+            INSERT OR IGNORE INTO audit_answers(audit_id,question_id,score,deviation,evidence,notes,updated_at)
+            VALUES (?,?,?,?,?,?,?)
+        """, (audit_id, qid, "", "", "", "", now))
+
+    conn.commit()
+    conn.close()
+
 def create_audit(hotel_code, norm, area, auditor_name, audit_date_str, status):
     conn = db()
     cur = conn.cursor()
@@ -533,15 +683,10 @@ def create_audit(hotel_code, norm, area, auditor_name, audit_date_str, status):
         VALUES (?,?,?,?,?,?,?,?,?,?,?)
     """, (acode, hotel_code, norm, area, auditor_name, audit_date_str or None, status, None, "", now, now))
     audit_id = cur.lastrowid
-    cur.execute("SELECT id FROM audit_questions WHERE norm=? AND is_active=1", (norm,))
-    qids = [row["id"] for row in cur.fetchall()]
-    for qid in qids:
-        cur.execute("""
-            INSERT OR IGNORE INTO audit_answers(audit_id,question_id,score,deviation,evidence,notes,updated_at)
-            VALUES (?,?,?,?,?,?,?)
-        """, (audit_id, qid, "", "", "", "", now))
     conn.commit()
     conn.close()
+
+    ensure_audit_answers(audit_id, norm)
     return acode
 
 def get_audit(audit_id: int) -> Dict:
@@ -555,12 +700,17 @@ def get_audit(audit_id: int) -> Dict:
 def audit_questions_answers(audit_id: int) -> pd.DataFrame:
     conn = db()
     df = pd.read_sql_query("""
-        SELECT aq.id as question_id, aq.norm, aq.chapter, aq.question,
+        SELECT aq.id as question_id, aq.norm, aq.chapter, aq.clause, aq.question, aq.evidence_hint,
                aa.id as answer_id, aa.score, aa.deviation, aa.evidence, aa.notes, aa.updated_at
         FROM audit_answers aa
         JOIN audit_questions aq ON aq.id = aa.question_id
         WHERE aa.audit_id=?
-        ORDER BY aq.chapter, aq.id
+        ORDER BY
+          CASE
+            WHEN aq.clause IS NULL THEN 999
+            ELSE 0
+          END,
+          aq.chapter, aq.clause, aq.id
     """, conn, params=(audit_id,))
     conn.close()
     return df
@@ -603,6 +753,7 @@ def update_audit_meta(audit_id: int, status: str, audit_date_str: Optional[str],
     """, (status, audit_date_str or None, auditor_name, summary, now, audit_id))
     conn.commit()
     conn.close()
+
 
 # ---------------------------
 # Actions
@@ -656,6 +807,7 @@ def delete_action(action_id: int):
     cur.execute("DELETE FROM actions WHERE id=?", (action_id,))
     conn.commit()
     conn.close()
+
 
 # ---------------------------
 # Attachments
@@ -732,6 +884,7 @@ def attachments_list_ui(hotel_code: str, entity_type: str, entity_id: int):
             st.success("Anhang gelöscht.")
             st.rerun()
 
+
 # ---------------------------
 # PDF Export (Audit Report)
 # ---------------------------
@@ -792,11 +945,11 @@ def make_audit_pdf(audit: Dict, dfq: pd.DataFrame, hotel_name: str) -> bytes:
 
     y -= 4*mm
     c.setFont("Helvetica-Bold", 11)
-    c.drawString(20*mm, y, "Checkliste & Ergebnisse")
+    c.drawString(20*mm, y, "Checkliste & Ergebnisse (Auszug)")
     y -= 8*mm
 
     c.setFont("Helvetica-Bold", 9)
-    c.drawString(20*mm, y, "Kapitel")
+    c.drawString(20*mm, y, "Clause")
     c.drawString(40*mm, y, "Bew.")
     c.drawString(55*mm, y, "Abw.")
     c.drawString(70*mm, y, "Frage (gekürzt)")
@@ -804,14 +957,14 @@ def make_audit_pdf(audit: Dict, dfq: pd.DataFrame, hotel_name: str) -> bytes:
     c.setFont("Helvetica", 9)
 
     for _, row in dfq.iterrows():
-        kap = str(row["chapter"])
-        sc = row["score"] or ""
-        dv = row["deviation"] or ""
-        q = (row["question"] or "")[:120]
-        c.drawString(20*mm, y, kap)
+        clause = (row.get("clause") or row.get("chapter") or "")
+        sc = row.get("score") or ""
+        dv = row.get("deviation") or ""
+        qtext = (row.get("question") or "")[:120]
+        c.drawString(20*mm, y, str(clause))
         c.drawString(40*mm, y, sc)
         c.drawString(55*mm, y, dv)
-        for line in wrap_text(q, 70):
+        for line in wrap_text(qtext, 70):
             c.drawString(70*mm, y, line)
             y -= 4.5*mm
             if y < 20*mm:
@@ -824,6 +977,7 @@ def make_audit_pdf(audit: Dict, dfq: pd.DataFrame, hotel_name: str) -> bytes:
     c.showPage()
     c.save()
     return buf.getvalue()
+
 
 # ---------------------------
 # Notifications (Outlook via Graph, Teams via Webhook)
@@ -988,6 +1142,54 @@ def send_digest(to_emails: List[str], hotel_filter: Optional[str], warn_days: in
         out["teams"] = teams_post_message(title, t)
     return out
 
+
+# ---------------------------
+# Audit Questions Management
+# ---------------------------
+def insert_questions_if_missing(questions: List[Tuple[str, str, Optional[str], str, str]]) -> int:
+    """
+    Inserts only missing questions (avoid duplicates) based on (norm, clause, question).
+    Returns count inserted.
+    """
+    conn = db()
+    cur = conn.cursor()
+
+    inserted = 0
+    for norm, chapter, clause, question, hint in questions:
+        cur.execute("""
+            SELECT 1 FROM audit_questions
+            WHERE norm=? AND COALESCE(clause,'')=COALESCE(?, '') AND question=?
+            LIMIT 1
+        """, (norm, clause, question))
+        exists = cur.fetchone()
+        if not exists:
+            cur.execute("""
+                INSERT INTO audit_questions(norm,chapter,clause,question,evidence_hint,is_active)
+                VALUES (?,?,?,?,?,1)
+            """, (norm, chapter, clause, question, hint))
+            inserted += 1
+
+    conn.commit()
+    conn.close()
+    return inserted
+
+def list_audit_questions(norm: Optional[str]=None) -> pd.DataFrame:
+    conn = db()
+    if norm:
+        df = pd.read_sql_query("""
+            SELECT * FROM audit_questions
+            WHERE norm=?
+            ORDER BY chapter, clause, id
+        """, conn, params=(norm,))
+    else:
+        df = pd.read_sql_query("""
+            SELECT * FROM audit_questions
+            ORDER BY norm, chapter, clause, id
+        """, conn)
+    conn.close()
+    return df
+
+
 # ---------------------------
 # Auth UI
 # ---------------------------
@@ -1031,6 +1233,7 @@ def header_ui(hotels_df: pd.DataFrame):
         if u and st.button("Logout"):
             st.session_state["user"] = None
             st.rerun()
+
 
 # ---------------------------
 # Pages
@@ -1253,6 +1456,9 @@ def page_audits(hotels_df: pd.DataFrame):
             st.error("Keine Berechtigung.")
             return
 
+        # Ensure answers exist for all active questions (important if catalog updated later)
+        ensure_audit_answers(audit["id"], audit["norm"])
+
         dfq = audit_questions_answers(audit["id"])
 
         with st.expander("Audit-Metadaten", expanded=True):
@@ -1296,21 +1502,34 @@ def page_audits(hotels_df: pd.DataFrame):
                     mime="application/pdf"
                 )
 
-        st.markdown("#### Checkliste")
+        st.markdown("#### Checkliste (TÜV-Style: Clause + Prüfhinweis/Nachweise)")
+        st.caption("Bewertung: 0=nicht erfüllt, 1=teilweise erfüllt, 2=erfüllt, NA=nicht anwendbar")
+
         for _, row in dfq.iterrows():
+            clause = row.get("clause") or row.get("chapter") or ""
             with st.container(border=True):
-                st.write(f"**{row['chapter']}** · {row['question']}")
+                st.write(f"**{clause}** · {row['question']}")
+                hint = (row.get("evidence_hint") or "").strip()
+                if hint:
+                    st.caption(f"Prüfhinweis/Nachweise/Stichprobe: {hint}")
+
                 c1, c2, c3, c4 = st.columns([1,1,2,2])
                 with c1:
-                    score = st.selectbox("Bewertung", ["","0","1","2","NA"],
-                                         index=["","0","1","2","NA"].index(row["score"] if row["score"] in ("0","1","2","NA") else ""),
-                                         key=f"sc_{row['answer_id']}")
+                    score = st.selectbox(
+                        "Bewertung",
+                        ["","0","1","2","NA"],
+                        index=["","0","1","2","NA"].index(row["score"] if row["score"] in ("0","1","2","NA") else ""),
+                        key=f"sc_{row['answer_id']}"
+                    )
                 with c2:
-                    dev = st.selectbox("Abweichung", ["","Nein","Ja"],
-                                       index=["","Nein","Ja"].index(row["deviation"] if row["deviation"] in ("Ja","Nein") else ""),
-                                       key=f"dv_{row['answer_id']}")
+                    dev = st.selectbox(
+                        "Abweichung",
+                        ["","Nein","Ja"],
+                        index=["","Nein","Ja"].index(row["deviation"] if row["deviation"] in ("Ja","Nein") else ""),
+                        key=f"dv_{row['answer_id']}"
+                    )
                 with c3:
-                    evidence = st.text_input("Nachweis", value=row["evidence"] or "", key=f"ev_{row['answer_id']}")
+                    evidence = st.text_input("Nachweis (Link/Ticket/Dokument)", value=row["evidence"] or "", key=f"ev_{row['answer_id']}")
                 with c4:
                     notes = st.text_input("Bemerkung", value=row["notes"] or "", key=f"nt_{row['answer_id']}")
 
@@ -1326,7 +1545,8 @@ def page_audits(hotels_df: pd.DataFrame):
             devs = dfq[dfq["deviation"] == "Ja"]
             created = 0
             for _, row in devs.iterrows():
-                title = f"[{audit['audit_code']}] {row['chapter']}: {row['question'][:120]}"
+                clause = row.get("clause") or row.get("chapter") or ""
+                title = f"[{audit['audit_code']}] {clause}: {row['question'][:120]}"
                 create_action(audit["hotel_code"], audit["id"], title, "Minor", "", None, "Offen", "Auto erzeugt aus Audit-Abweichung")
                 created += 1
             st.success(f"{created} Maßnahmen erstellt.")
@@ -1519,17 +1739,33 @@ def page_admin(hotels_df: pd.DataFrame):
         st.info("Default Admin: admin@local / admin123 (bitte sofort ändern).")
 
     with tab3:
-        st.markdown("### Auditfragen-Katalog")
-        conn = db()
-        dfq = pd.read_sql_query("SELECT * FROM audit_questions ORDER BY norm, chapter, id", conn)
-        conn.close()
-        st.dataframe(dfq, use_container_width=True, hide_index=True)
+        st.markdown("### Auditfragen-Katalog (inkl. Clause + Prüfhinweis)")
 
+        c1, c2 = st.columns([1,1])
+        with c1:
+            norm_filter = st.selectbox("Norm filtern", ["Alle","ISO 9001","ISO 14001","ISO 45001","ISO 50001"], index=4)
+        with c2:
+            st.write("")
+            st.write("")
+
+        if st.button("ISO 50001 Katalog importieren/aktualisieren (fehlende Fragen hinzufügen)"):
+            inserted = insert_questions_if_missing(build_questions_50001_detailed())
+            st.success(f"Fertig. Neu eingefügt: {inserted} Fragen.")
+            st.rerun()
+
+        dfq = list_audit_questions(None if norm_filter == "Alle" else norm_filter)
+        show = dfq.copy()
+        show = show[["id","norm","chapter","clause","question","evidence_hint","is_active"]]
+        st.dataframe(show, use_container_width=True, hide_index=True)
+
+        st.divider()
         st.markdown("#### Frage hinzufügen")
         with st.form("add_q"):
             norm = st.selectbox("Norm", ["ISO 9001","ISO 14001","ISO 45001","ISO 50001"])
-            chapter = st.text_input("Kapitel", "6")
-            question = st.text_area("Frage", "", height=80)
+            chapter = st.text_input("Kapitel", "6", help="z.B. 6 oder 9")
+            clause = st.text_input("Clause/Subclause", "6.3", help="z.B. 6.3 oder 9.1.1 (optional)")
+            question = st.text_area("Frage", "", height=90)
+            hint = st.text_area("Prüfhinweis / Nachweise / Stichprobe", "", height=90)
             ok = st.form_submit_button("Hinzufügen")
         if ok:
             if not question.strip():
@@ -1537,8 +1773,10 @@ def page_admin(hotels_df: pd.DataFrame):
             else:
                 conn = db()
                 cur = conn.cursor()
-                cur.execute("INSERT INTO audit_questions(norm,chapter,question,is_active) VALUES (?,?,?,1)",
-                            (norm, chapter.strip(), question.strip()))
+                cur.execute("""
+                    INSERT INTO audit_questions(norm,chapter,clause,question,evidence_hint,is_active)
+                    VALUES (?,?,?,?,?,1)
+                """, (norm, chapter.strip(), clause.strip() or None, question.strip(), hint.strip()))
                 conn.commit()
                 conn.close()
                 st.success("Hinzugefügt.")
@@ -1551,12 +1789,14 @@ def page_admin(hotels_df: pd.DataFrame):
         st.caption("Für Outlook/Graph brauchst du eine Azure App Registration (Client Credentials) + Mail.Send (Application) + Admin Consent.")
         st.caption("Für Teams reicht ein Incoming Webhook im gewünschten Channel.")
 
+
 # ---------------------------
 # App
 # ---------------------------
 def main():
     st.set_page_config(page_title=APP_TITLE, layout="wide")
     init_db()
+    migrate_db()
     seed_if_empty()
     compute_and_store_next_dates()
 

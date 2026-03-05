@@ -270,7 +270,7 @@ def seed_if_empty():
         """, ("admin@local", "Admin", sha256("admin123"), "Admin", None, 1, now))
 
         # Example directors
-        for hc in ["H1","H2","H3","H4","H5"]:
+        for hc in ["6502","6513","6527","6551","6595"]:
             cur.execute("""
                 INSERT INTO users(email,name,password_hash,role,hotel_code,is_active,created_at)
                 VALUES (?,?,?,?,?,?,?)

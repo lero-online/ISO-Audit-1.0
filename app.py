@@ -1,30 +1,41 @@
-# app.py
-# Streamlit Web-App: Audits + Betreiberpflichten + Maßnahmen + Uploads + PDF + Outlook/Teams
+# app.py  (MAXI-VERSION – komplett)
+# Streamlit Web-App: Audit-Management (ISO 50001/14001/45001/9001) + Betreiberpflichten + Maßnahmen + Auditprogramm
+# + Anhänge + PDF-Export + Digest-Notifications (Outlook Graph / Teams Webhook)
 #
-# ✅ 5 Hotels (Codes 6502/6513/6527/6551/6595)
-# ✅ Hotelanzeige überall: "CODE – NAME"
-# ✅ Direktor/Techniker sehen automatisch nur ihr eigenes Hotel
+# ✅ 5 Hotels fix hinterlegt:
+#   6502 Hotel München City Center Affiliated by Melia
+#   6513 Hotel Frankfurt Messe Affiliated by Melia
+#   6527 INNSiDE by Meliá München Parkstadt Schwabing
+#   6551 INNSiDE by Meliá Frankfurt Ostend
+#   6595 Melia Frankfurt City
 #
-# ✅ Auditfragen TÜV-Style:
-#    - Clause/Subclause (z.B. 6.3, 9.1.1)
-#    - sehr konkrete Prüffragen
-#    - Prüfhinweis/Nachweise/Stichprobe
+# ✅ Rollen/Logins (lokal in DB):
+#   Admin: admin@local / admin123
+#   Direktor je Hotel: direktor_<HOTELCODE>@local / director123
+#   (Optional) Auditor kannst du als Admin anlegen
 #
-# ✅ Kataloge (detailliert):
-#    - ISO 50001 (detailliert)
-#    - ISO 14001 (detailliert)
-#    - ISO 45001 (detailliert)
+# ✅ Auditbogen “TÜV-Style”:
+#   Clause + konkrete Prüffrage + Prüfhinweise (Nachweise/Stichprobe)
+#   Bewertung: 0/1/2 + Abweichung Ja/Nein + Typ OFI/Minor/Major
 #
-# ✅ Abweichungsklassifizierung wie Audittools:
-#    - Abweichung: Nein/Ja
-#    - Wenn Ja: Typ = OFI / Minor / Major
+# ✅ Maßnahmen-Workflow:
+#   Status: Offen → In Bearbeitung → Wirksamkeit offen → Erledigt
+#   Bei Major: Pflichtfelder (Risiko, Sofortmaßnahme, Ursache, Korrekturmaßnahme, Frist)
+#   Bei Erledigt: Pflichtfelder Wirksamkeitsdatum + Ergebnis
 #
-# ✅ Migration:
-#    - ergänzt automatisch fehlende DB-Spalten (ohne Datenverlust)
+# ✅ Betreiberpflichten (Prüfkalender) mit Fälligkeiten + KPI
+# ✅ Auditprogramm/Jahresplan
+# ✅ Anhänge überall
+# ✅ PDF Export Auditbericht
+# ✅ Digest per Outlook (Graph) / Teams (Webhook)
 #
-# Start:
-#   pip install -r requirements.txt
-#   streamlit run app.py
+# requirements.txt (neben app.py anlegen):
+#   streamlit>=1.31
+#   pandas>=2.0
+#   requests>=2.31
+#   reportlab>=4.0
+#   python-dotenv>=1.0
+
 
 import os
 import sqlite3
@@ -40,12 +51,15 @@ from reportlab.lib.pagesizes import A4
 from reportlab.pdfgen import canvas
 from reportlab.lib.units import mm
 
-APP_TITLE = "Audit & Betreiberpflichten – Hotel Web-App"
+
+# ---------------------------
+# Config
+# ---------------------------
+APP_TITLE = "Audit & Betreiberpflichten – Hotel Web-App (MAXI)"
 DB_PATH = os.environ.get("AUDIT_APP_DB", "audit_app.db")
 UPLOAD_DIR = os.environ.get("AUDIT_APP_UPLOAD_DIR", "uploads")
 APP_BASE_URL = os.environ.get("APP_BASE_URL", "").rstrip("/")
 
-# Deine Hotels (Code -> Name, Stadt)
 HOTELS = [
     ("6502", "Hotel München City Center Affiliated by Melia", "München"),
     ("6513", "Hotel Frankfurt Messe Affiliated by Melia", "Frankfurt"),
@@ -55,13 +69,13 @@ HOTELS = [
 ]
 HOTEL_CODES = [h[0] for h in HOTELS]
 
-# Microsoft Graph / Outlook
+# Microsoft Graph / Outlook (optional)
 MS_TENANT_ID = os.environ.get("MS_TENANT_ID")
 MS_CLIENT_ID = os.environ.get("MS_CLIENT_ID")
 MS_CLIENT_SECRET = os.environ.get("MS_CLIENT_SECRET")
-MAIL_SENDER_UPN = os.environ.get("MAIL_SENDER_UPN")
+MAIL_SENDER_UPN = os.environ.get("MAIL_SENDER_UPN")  # z.B. "service-account@deinefirma.de"
 
-# Teams
+# Teams (optional)
 TEAMS_WEBHOOK_URL = os.environ.get("TEAMS_WEBHOOK_URL")
 
 
@@ -74,6 +88,9 @@ def sha256(s: str) -> str:
 def today() -> date:
     return date.today()
 
+def utc_now_iso() -> str:
+    return datetime.utcnow().isoformat()
+
 def parse_date(s: Optional[str]) -> Optional[date]:
     if not s:
         return None
@@ -84,9 +101,6 @@ def parse_date(s: Optional[str]) -> Optional[date]:
 
 def fmt_date(d: Optional[date]) -> str:
     return d.strftime("%d.%m.%Y") if d else ""
-
-def utc_now_iso() -> str:
-    return datetime.utcnow().isoformat()
 
 def add_months(d: date, months: int) -> date:
     import calendar
@@ -110,6 +124,17 @@ def status_from_days(days: Optional[int], warn_days=30) -> str:
 def severity_rank(status: str) -> int:
     return {"Überfällig": 0, "Fällig": 1, "Bald fällig": 2, "OK": 3, "—": 4}.get(status, 99)
 
+def ensure_upload_dir():
+    os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+def safe_filename(name: str) -> str:
+    name = name.replace("\\", "_").replace("/", "_")
+    return "".join(c for c in name if c.isalnum() or c in (" ", ".", "_", "-", "(", ")")).strip()
+
+
+# ---------------------------
+# Auth
+# ---------------------------
 def require_login():
     if "user" not in st.session_state or not st.session_state["user"]:
         st.info("Bitte einloggen.")
@@ -130,13 +155,6 @@ def can_access_hotel(hotel_code: str) -> bool:
     if u["role"] == "Auditor":
         return True
     return False
-
-def ensure_upload_dir():
-    os.makedirs(UPLOAD_DIR, exist_ok=True)
-
-def safe_filename(name: str) -> str:
-    name = name.replace("\\", "_").replace("/", "_")
-    return "".join(c for c in name if c.isalnum() or c in (" ", ".", "_", "-", "(", ")")).strip()
 
 
 # ---------------------------
@@ -200,7 +218,7 @@ def init_db():
         area TEXT NOT NULL,
         auditor_name TEXT,
         audit_date TEXT,
-        status TEXT NOT NULL,
+        status TEXT NOT NULL,     -- Geplant/Durchgeführt/Abgeschlossen
         score REAL,
         summary TEXT,
         created_at TEXT NOT NULL,
@@ -218,16 +236,13 @@ def init_db():
         is_active INTEGER NOT NULL DEFAULT 1
     );
 
-    -- audit_answers upgraded:
-    -- deviation: "Ja"/"Nein"
-    -- deviation_type: "OFI"/"Minor"/"Major"
     CREATE TABLE IF NOT EXISTS audit_answers (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         audit_id INTEGER NOT NULL,
         question_id INTEGER NOT NULL,
-        score TEXT,
-        deviation TEXT,
-        deviation_type TEXT,
+        score TEXT,              -- 0/1/2
+        deviation TEXT,          -- Ja/Nein
+        deviation_type TEXT,     -- OFI/Minor/Major
         evidence TEXT,
         notes TEXT,
         updated_at TEXT NOT NULL,
@@ -241,11 +256,16 @@ def init_db():
         hotel_code TEXT NOT NULL,
         audit_id INTEGER,
         title TEXT NOT NULL,
-        category TEXT NOT NULL,
+        category TEXT NOT NULL,      -- Major/Minor/Beobachtung/Verbesserung
         owner_name TEXT,
         due_date TEXT,
-        status TEXT NOT NULL,
+        status TEXT NOT NULL,        -- Offen/In Bearbeitung/Wirksamkeit offen/Erledigt
         effectiveness_date TEXT,
+        effectiveness_result TEXT,
+        risk_level TEXT,             -- Niedrig/Mittel/Hoch
+        immediate_action TEXT,
+        root_cause TEXT,
+        corrective_action TEXT,
         notes TEXT,
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL,
@@ -253,10 +273,25 @@ def init_db():
         FOREIGN KEY (audit_id) REFERENCES audits(id) ON DELETE SET NULL
     );
 
+    CREATE TABLE IF NOT EXISTS audit_program (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        hotel_code TEXT NOT NULL,
+        norm TEXT NOT NULL,
+        area TEXT NOT NULL,
+        planned_date TEXT NOT NULL,
+        owner_name TEXT,
+        status TEXT NOT NULL,        -- Geplant/Durchgeführt/Abgesagt
+        reminder_days INTEGER DEFAULT 14,
+        notes TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        FOREIGN KEY (hotel_code) REFERENCES hotels(code) ON DELETE CASCADE
+    );
+
     CREATE TABLE IF NOT EXISTS attachments (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         hotel_code TEXT NOT NULL,
-        entity_type TEXT NOT NULL,
+        entity_type TEXT NOT NULL,   -- compliance/audit/action/program
         entity_id INTEGER NOT NULL,
         filename TEXT NOT NULL,
         stored_path TEXT NOT NULL,
@@ -270,26 +305,215 @@ def init_db():
     conn.close()
 
 def migrate_db():
-    """Adds missing columns to existing DB without data loss."""
     conn = db()
     cur = conn.cursor()
 
     # audit_questions: clause/evidence_hint
     cur.execute("PRAGMA table_info(audit_questions)")
-    cols_q = {row[1] for row in cur.fetchall()}
-    if "clause" not in cols_q:
+    cols = {r[1] for r in cur.fetchall()}
+    if "clause" not in cols:
         cur.execute("ALTER TABLE audit_questions ADD COLUMN clause TEXT")
-    if "evidence_hint" not in cols_q:
+    if "evidence_hint" not in cols:
         cur.execute("ALTER TABLE audit_questions ADD COLUMN evidence_hint TEXT")
 
     # audit_answers: deviation_type
     cur.execute("PRAGMA table_info(audit_answers)")
-    cols_a = {row[1] for row in cur.fetchall()}
-    if "deviation_type" not in cols_a:
+    cols = {r[1] for r in cur.fetchall()}
+    if "deviation_type" not in cols:
         cur.execute("ALTER TABLE audit_answers ADD COLUMN deviation_type TEXT")
+
+    # actions: new columns for workflow
+    cur.execute("PRAGMA table_info(actions)")
+    cols = {r[1] for r in cur.fetchall()}
+    for col, ddl in [
+        ("effectiveness_result", "ALTER TABLE actions ADD COLUMN effectiveness_result TEXT"),
+        ("risk_level", "ALTER TABLE actions ADD COLUMN risk_level TEXT"),
+        ("immediate_action", "ALTER TABLE actions ADD COLUMN immediate_action TEXT"),
+        ("root_cause", "ALTER TABLE actions ADD COLUMN root_cause TEXT"),
+        ("corrective_action", "ALTER TABLE actions ADD COLUMN corrective_action TEXT"),
+    ]:
+        if col not in cols:
+            cur.execute(ddl)
+
+    # audit_program safety
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS audit_program (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            hotel_code TEXT NOT NULL,
+            norm TEXT NOT NULL,
+            area TEXT NOT NULL,
+            planned_date TEXT NOT NULL,
+            owner_name TEXT,
+            status TEXT NOT NULL,
+            reminder_days INTEGER DEFAULT 14,
+            notes TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY (hotel_code) REFERENCES hotels(code) ON DELETE CASCADE
+        )
+    """)
 
     conn.commit()
     conn.close()
+
+
+# ---------------------------
+# Seed
+# ---------------------------
+def build_questions_50001_tuvstyle_big() -> List[Tuple[str, str, str, str, str]]:
+    """
+    Größerer Katalog (TÜV-artig formuliert) – bewusst praxisnah für Hoteltechnik/GLT/SEU.
+    Du kannst ihn später jederzeit erweitern (Admin → Fragenkatalog).
+    """
+    q: List[Tuple[str, str, str, str, str]] = []
+    def add(ch: str, cl: str, qu: str, hint: str):
+        q.append(("ISO 50001", ch, cl, qu, hint))
+
+    # 4 Kontext
+    add("4", "4.1",
+        "Ist der Kontext der Organisation in Bezug auf Energie (interne/externe Themen) dokumentiert und aktuell (z.B. Preis-/Versorgungsrisiken, technische Rahmenbedingungen, Betriebsmodell Pächter/Eigentümer)?",
+        "Nachweise: Kontextanalyse, Protokoll Aktualisierung, Energiepreis-/Lieferantenrisiken, Schnittstellen Eigentümer/FM.")
+    add("4", "4.2",
+        "Sind interessierte Parteien (Eigentümer, Betreiber, Gäste, Behörden, FM-Dienstleister) und deren relevante Anforderungen bzgl. Energie/EnMS ermittelt, bewertet und regelmäßig überprüft?",
+        "Nachweise: Stakeholderliste, Anforderungen, Review-Intervall, Änderungen dokumentiert.")
+    add("4", "4.3",
+        "Ist der Geltungsbereich des EnMS (Standorte, Prozesse, Energiearten, wesentliche Anlagen) festgelegt und sind Abgrenzungen/Outsourcing (z.B. FM) geregelt?",
+        "Nachweise: Scope-Dokument, Schnittstellenbeschreibung, Verantwortlichkeiten, Ausnahmen begründet.")
+    add("4", "4.4",
+        "Ist das EnMS prozessual beschrieben (Dokumentation, Wechselwirkungen, Verantwortlichkeiten) und im Betrieb wirksam umgesetzt?",
+        "Nachweise: Prozesslandkarte/Handbuch, Rollen, Verantwortlichkeiten, Wirksamkeitsnachweise.")
+
+    # 5 Führung
+    add("5", "5.1",
+        "Ist Leadership nachweisbar (Ressourcen, Priorisierung, Entscheidungen, Teilnahme an Reviews, Beseitigung von Hindernissen)?",
+        "Nachweise: Managementreview, Budgetentscheidungen, Eskalationen/Entscheidungen, Ressourcenplanung.")
+    add("5", "5.2",
+        "Existiert eine Energiepolitik, ist sie angemessen, kommuniziert, verstanden und wird sie regelmäßig überprüft?",
+        "Nachweise: Energiepolitik, Kommunikation (Aushang/Intranet), Unterweisungen, Review-Vermerk.")
+    add("5", "5.3",
+        "Sind Rollen/Verantwortlichkeiten/Kompetenzen (inkl. GLT/Technik/FM) definiert und bekannt (z.B. Energiebeauftragter)?",
+        "Nachweise: Organigramm, Stellenbeschreibungen, Vollmachten, Schulungsnachweise.")
+
+    # 6 Planung
+    add("6", "6.1.1",
+        "Wurden Risiken und Chancen identifiziert (energiebezogen, Betrieb/Verfügbarkeit, Investitionsrisiken) und Maßnahmen geplant?",
+        "Nachweise: Risiko-/Chancenliste, Maßnahmenplan, Verantwortliche, Termine, Nachverfolgung.")
+    add("6", "6.2",
+        "Sind Energieziele/Teilziele SMART definiert (Hotel-spezifisch), inkl. Verantwortlichen, Ressourcen, Zeitplan und Bewertungsmethodik?",
+        "Nachweise: Zielmatrix, Freigaben, KPI/EnPI, Budget/Ressourcen, Statusberichte.")
+    add("6", "6.3",
+        "Ist die energetische Bewertung nachvollziehbar (Energiebilanz, SEU, Einflussgrößen, Datenqualität, Lastprofile)?",
+        "Nachweise: Energiebilanz, Lastgangdaten, Top-Verbraucher, Einflussfaktoren (Belegung/Wetter), Datenlückenanalyse.")
+    add("6", "6.4",
+        "Sind EnPI festgelegt (z.B. kWh/Übernachtung, kWh/m², witterungs-/belegungsbereinigt) inkl. Rechenlogik und Normalisierung?",
+        "Nachweise: EnPI-Definition, Datenquelle, Berechnungsblatt/Tool, Normalisierungsansatz dokumentiert.")
+    add("6", "6.5",
+        "Ist eine energetische Ausgangsbasis (EnB) definiert und Änderungen (z.B. Umbau, Anlagenwechsel) werden gesteuert und dokumentiert?",
+        "Nachweise: EnB-Festlegung, Änderungsmanagement, Vergleichbarkeit, Anpassungsregeln.")
+
+    # 7 Unterstützung
+    add("7", "7.2",
+        "Sind Kompetenzen für energiebezogene Aufgaben (Technik, GLT, Betreiberpflichten, Einkauf) definiert und werden Schulungen nachweisbar durchgeführt?",
+        "Nachweise: Kompetenzmatrix, Schulungsplan, Nachweise, Wirksamkeitskontrolle.")
+    add("7", "7.3",
+        "Sind Mitarbeitende/Fremdfirmen hinsichtlich Energiepolitik, relevanter Betriebsregeln und energiebezogener Auswirkungen sensibilisiert?",
+        "Nachweise: Unterweisungen, Toolbox-Talks, Lieferanteninfo, Aushänge.")
+    add("7", "7.4",
+        "Sind interne/externe Kommunikationsprozesse (Energiekennzahlen, Abweichungen, Projekte) festgelegt und eingehalten?",
+        "Nachweise: Kommunikationsplan, Reports, Meeting-Protokolle, Eskalationswege.")
+    add("7", "7.5",
+        "Ist dokumentierte Information gelenkt (Versionen, Freigaben, Zugriff, Aufbewahrung) inkl. GLT/Protokolle?",
+        "Nachweise: Dokumentenlenkung, Zugriffs-/Rechtekonzept, Aufbewahrungsregeln.")
+
+    # 8 Betrieb
+    add("8", "8.1",
+        "Sind operative Steuerungen/Kriterien für SEU festgelegt (Setpoints, Laufzeiten, Wartung, saisonale Konzepte) und werden sie überwacht?",
+        "Nachweise: SOP, GLT-Screens/Parameter, Änderungslog, Stichproben Zimmer/Etagen, Abweichungsmanagement.")
+    add("8", "8.2",
+        "Werden energiebezogene Anforderungen bei Planung/Änderungen von Anlagen berücksichtigt (Design, Inbetriebnahme, Abnahme, M&V)?",
+        "Nachweise: Projektunterlagen, Spezifikationen, Abnahmen, Inbetriebnahmeprotokolle, M&V-Plan.")
+    add("8", "8.3",
+        "Werden energiebezogene Kriterien in der Beschaffung angewendet (Energieeffizienz, Lebenszykluskosten, Spezifikationen, Lieferantenanforderungen)?",
+        "Nachweise: Beschaffungsrichtlinie, Vergabeunterlagen, Bestellprozesse, Vergleichsrechnungen.")
+    add("8", "8.4",
+        "Sind ausgelagerte Prozesse (FM, Wartung) energiebezogen gesteuert (Leistungsumfang, KPI, Reporting, Abweichungen)?",
+        "Nachweise: Verträge/SLAs, KPI-Reports, Jour-fixe Protokolle, Eskalationen.")
+
+    # 9 Bewertung der Leistung
+    add("9", "9.1.1",
+        "Existiert ein Mess-/Monitoringkonzept (Zählerstruktur, Frequenz, Verantwortliche, Datenqualität) und ist es umgesetzt?",
+        "Nachweise: Zählerliste, Messstellenplan, Plausibilisierung, Datenlücken/Fehlerbehandlung, Kalibrierung falls relevant.")
+    add("9", "9.1.2",
+        "Werden energiebezogene Leistungskennzahlen regelmäßig ausgewertet (Trend/Abweichungen, Ursachen, Maßnahmen)?",
+        "Nachweise: Monatsreport, Trendgrafiken, Abweichungsanalysen, Maßnahmenverfolgung.")
+    add("9", "9.2",
+        "Werden interne Audits geplant und durchgeführt (Programm, Kompetenz/Unabhängigkeit, Berichte, Maßnahmen)?",
+        "Nachweise: Auditprogramm, Checklisten, Auditberichte, Maßnahmen/CAPA, Wirksamkeitsprüfung.")
+    add("9", "9.3",
+        "Findet Managementreview statt und deckt es alle Inputs/Outputs ab (Performance, Ziele, Risiken, Ressourcen, Verbesserungen)?",
+        "Nachweise: Review-Protokolle, Beschlüsse, Ressourcenentscheidungen, Follow-up.")
+
+    # 10 Verbesserung
+    add("10", "10.1",
+        "Werden Verbesserungsmöglichkeiten systematisch identifiziert und priorisiert (Quick Wins, Investitionen, Betriebskonzepte)?",
+        "Nachweise: Ideen-/Projektliste, Priorisierung (ROI/Impact), Status, Ergebnisse.")
+    add("10", "10.2",
+        "Werden Nichtkonformitäten inkl. Ursachenanalyse, Korrektur-/Korrekturmaßnahmen, Fristen und Wirksamkeitsprüfung bearbeitet?",
+        "Nachweise: CAPA-Records, RCA (5-Why/Fishbone), Nachweise Umsetzung, Wirksamkeit dokumentiert.")
+    add("10", "10.3",
+        "Wird die kontinuierliche Verbesserung des EnMS nachweisbar betrieben (Lessons Learned, Standards, Best Practices zwischen Hotels)?",
+        "Nachweise: Verbesserungsjournal, Standardisierung, Kommunikation zwischen Standorten.")
+
+    return q
+
+def build_questions_14001_tuvstyle() -> List[Tuple[str, str, str, str, str]]:
+    q: List[Tuple[str, str, str, str, str]] = []
+    def add(ch: str, cl: str, qu: str, hint: str):
+        q.append(("ISO 14001", ch, cl, qu, hint))
+    add("4","4.1","Ist der Kontext inkl. Umweltbedingungen (Nachbarschaft, Behördenauflagen, Risiken) dokumentiert und aktuell?",
+        "Nachweise: Kontext, Risikoanalyse, Umfeld, Review.")
+    add("6","6.1.2","Sind Umweltaspekte (normal/abnormal/Notfall) identifiziert, bewertet und aktuell?",
+        "Nachweise: Aspektebewertung (Wasser, Abfall, Chemie, Emissionen, Lärm), Kriterien, Review.")
+    add("6","6.1.3","Sind bindende Verpflichtungen (Gesetze, Auflagen, Verträge) identifiziert und bewertet?",
+        "Nachweise: Rechtskataster, Genehmigungen/Auflagen, Compliance-Bewertung.")
+    add("8","8.1","Sind operative Steuerungen für wesentliche Umweltaspekte umgesetzt (inkl. Lieferanten/Fremdfirmen)?",
+        "Nachweise: SOP/Checklisten, Entsorgung, Gefahrstoffe, Fremdfirmensteuerung.")
+    add("8","8.2","Ist Notfallvorsorge/Reaktion geplant, umgesetzt und geübt (z.B. Leckage, Chemie, Brand)?",
+        "Nachweise: Notfallpläne, Übungen, Protokolle, Verbesserungen.")
+    add("9","9.1.2","Wird Compliance regelmäßig bewertet?",
+        "Nachweise: Compliance-Review, Prüfplan, Nachweise, Maßnahmen.")
+    return q
+
+def build_questions_45001_tuvstyle() -> List[Tuple[str, str, str, str, str]]:
+    q: List[Tuple[str, str, str, str, str]] = []
+    def add(ch: str, cl: str, qu: str, hint: str):
+        q.append(("ISO 45001", ch, cl, qu, hint))
+    add("4","4.1","Ist der Kontext inkl. Arbeitsschutz-Risiken (Gäste/Personal/Fremdfirmen) dokumentiert und aktuell?",
+        "Nachweise: Kontext, Risikoanalyse, Review.")
+    add("6","6.1.2","Ist die Gefährdungsbeurteilung vorhanden, aktuell und deckt Tätigkeiten/Arbeitsmittel ab?",
+        "Nachweise: GBU je Bereich (Technik/Housekeeping/Küche), Maßnahmen, Aktualisierung, Beteiligung.")
+    add("7","7.2","Sind Kompetenzen/Unterweisungen nachweisbar und wirksam (inkl. Fremdfirmen)?",
+        "Nachweise: Unterweisungsplan, Nachweise, Wirksamkeitsprüfung, Toolbox-Talks.")
+    add("8","8.1.3","Ist die Fremdfirmensteuerung wirksam (Einweisung, Freigaben, Aufsicht, Doku)?",
+        "Nachweise: Fremdfirmenprozess, Unterweisungen, Erlaubnisscheine, Stichprobe.")
+    add("8","8.1.4","Ist Notfallvorsorge/Reaktion umgesetzt (Erste Hilfe, Brand, Evakuierung)?",
+        "Nachweise: Notfallpläne, Übungen, Ersthelferliste, Protokolle.")
+    add("10","10.2","Werden Vorfälle inkl. Ursachenanalyse, CAPA und Wirksamkeitsprüfung bearbeitet?",
+        "Nachweise: Unfallberichte, RCA, CAPA, Wirksamkeitsnachweis.")
+    return q
+
+def build_default_questions() -> List[Tuple[str, str, Optional[str], str, str]]:
+    qs: List[Tuple[str, str, Optional[str], str, str]] = []
+    # ISO 9001 – kurzer Start (kannst du später ausbauen)
+    qs += [
+        ("ISO 9001","4","4.1","Sind Kontext/Stakeholder/Scope nachvollziehbar festgelegt?","Nachweis: Kontextanalyse, Stakeholderliste, Scope."),
+        ("ISO 9001","6","6.1","Sind Risiken/Chancen bewertet und Ziele geplant?","Nachweis: Risiko-/Chancenliste, Zielmatrix, Maßnahmenplan."),
+        ("ISO 9001","9","9.3","Findet Managementreview statt und sind Outputs dokumentiert?","Nachweis: Protokolle, Entscheidungen, Ressourcen."),
+    ]
+    qs += build_questions_50001_tuvstyle_big()
+    qs += build_questions_14001_tuvstyle()
+    qs += build_questions_45001_tuvstyle()
+    return qs
 
 def seed_if_empty():
     conn = db()
@@ -320,7 +544,7 @@ def seed_if_empty():
                 VALUES (?,?,?,?,?,?,?)
             """, (f"direktor_{hc}@local", f"Direktor {hc} – {hname}", sha256("director123"), "Direktor", hc, 1, now))
 
-    # Compliance seed
+    # Betreiberpflichten Seed
     cur.execute("SELECT COUNT(*) c FROM compliance_items")
     if cur.fetchone()["c"] == 0:
         now = utc_now_iso()
@@ -345,14 +569,27 @@ def seed_if_empty():
             VALUES (?,?,?,?,?,?,?,?,?,?)
         """, rows)
 
-    # Audit questions seed only if empty
+    # Audit questions
     cur.execute("SELECT COUNT(*) c FROM audit_questions")
     if cur.fetchone()["c"] == 0:
-        all_questions = build_default_questions()
         cur.executemany("""
             INSERT INTO audit_questions(norm,chapter,clause,question,evidence_hint,is_active)
             VALUES (?,?,?,?,?,1)
-        """, all_questions)
+        """, build_default_questions())
+
+    # Auditprogramm seed
+    cur.execute("SELECT COUNT(*) c FROM audit_program")
+    if cur.fetchone()["c"] == 0:
+        now = utc_now_iso()
+        y = today().year
+        seed_rows = []
+        for hc in HOTEL_CODES:
+            seed_rows.append((hc, "ISO 50001", "Technik/Energie", date(y, 3, 15).isoformat(), "", "Geplant", 14, "Seed", now, now))
+            seed_rows.append((hc, "ISO 45001", "Arbeitsschutz/Fremdfirmen", date(y, 9, 15).isoformat(), "", "Geplant", 14, "Seed", now, now))
+        cur.executemany("""
+            INSERT INTO audit_program(hotel_code,norm,area,planned_date,owner_name,status,reminder_days,notes,created_at,updated_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?)
+        """, seed_rows)
 
     conn.commit()
     conn.close()
@@ -373,289 +610,7 @@ def compute_and_store_next_dates():
 
 
 # ---------------------------
-# Questions Catalogs (detailliert, TÜV-Style – neu erstellt)
-# ---------------------------
-def build_questions_50001_detailed() -> List[Tuple[str, str, str, str, str]]:
-    q: List[Tuple[str, str, str, str, str]] = []
-    def add(chapter: str, clause: str, question: str, hint: str):
-        q.append(("ISO 50001", chapter, clause, question, hint))
-
-    # 4 Context
-    add("4", "4.1", "Ist der Kontext der Organisation (interne/externe Themen) energiebezogen dokumentiert, plausibel und aktuell?",
-        "Nachweis: Kontextanalyse, Energie-/Klimarisiken, Preis-/Versorgungsrisiken, technische Randbedingungen, Aktualisierung.")
-    add("4", "4.2", "Sind interessierte Parteien und deren energiebezogene Anforderungen ermittelt, bewertet und überwacht?",
-        "Nachweis: Stakeholderliste (Eigentümer/Pächter/Behörden/Gäste/FM), Anforderungen, Monitoring/Review.")
-    add("4", "4.3", "Ist der Geltungsbereich des EnMS definiert (Standorte/Anlagen/Energiearten) inkl. Abgrenzungen/Begründung?",
-        "Nachweis: Scope-Dokument, Abgrenzungen, Outsourcing-Schnittstellen, Verantwortungen.")
-    add("4", "4.4", "Sind EnMS-Prozesse inkl. Wechselwirkungen, Verantwortlichkeiten, Inputs/Outputs dokumentiert?",
-        "Nachweis: Prozesslandkarte, Verfahren, RACI, Schnittstellen Hotel/OC/Externe.")
-
-    # 5 Leadership
-    add("5", "5.1", "Ist Top-Management-Commitment nachweisbar (Ziele, Ressourcen, Reviews, Entscheidungen)?",
-        "Nachweis: Managementreview, Zielvorgaben, Ressourcenfreigaben, Beschlüsse/Eskalationen.")
-    add("5", "5.2", "Gibt es eine Energiepolitik, die Verbesserung der Energieperformance fordert und kommuniziert wird?",
-        "Nachweis: Energiepolitik, Freigabe/Version, Kommunikation (Intranet/Aushang), Kenntnisnachweise.")
-    add("5", "5.3", "Sind Rollen/Verantwortlichkeiten/Kompetenzen (Energie-Team, Standortverantwortliche) festgelegt und verstanden?",
-        "Nachweis: Rollenbeschreibung, Stellvertretung, Interview-Stichprobe, Aufgabenpaket.")
-
-    # 6 Planning
-    add("6", "6.1.1", "Sind Risiken/Chancen zur Energieperformance identifiziert, bewertet und in Maßnahmen überführt?",
-        "Nachweis: Risiko-/Chancenliste, Priorisierung, Maßnahmenplan, Owner/Fristen.")
-    add("6", "6.1.2", "Sind bindende Verpflichtungen (gesetzlich/vertraglich) energiebezogen identifiziert und aktuell?",
-        "Nachweis: Rechtskataster, Verträge/Pacht, Betreiberpflichten, Change-Management.")
-    add("6", "6.2", "Sind Energieziele SMART definiert, mit Verantwortlichen, Terminen und Monitoring (EnPI)?",
-        "Nachweis: Zielmatrix, KPI/EnPI, Reporting, Zielverfolgung.")
-    add("6", "6.3", "Ist die energetische Bewertung durchgeführt (Energiebilanz, Verbraucher, Lastprofile) und nachvollziehbar?",
-        "Nachweis: Energiebilanz (Strom/Gas/Fernwärme/Kälte), Top-Verbraucher, Lastgänge.")
-    add("6", "6.3", "Sind SEU identifiziert, begründet und wird bei Änderungen (Umbau/Belegung/Anlagenwechsel) aktualisiert?",
-        "Nachweis: SEU-Kriterien, SEU-Liste, Aktualisierungsprozess, letzter Review.")
-    add("6", "6.4", "Sind EnPI passend definiert (z.B. kWh/Übernachtung, kWh/m², witterungs-/belegungsbereinigt)?",
-        "Nachweis: Definition, Datenquellen, Berechnungslogik, Normalisierung.")
-    add("6", "6.5", "Ist die Energiebaseline (EnB) festgelegt inkl. Anpassungsregeln bei wesentlichen Änderungen?",
-        "Nachweis: Baseline-Zeitraum, Normalisierung, Anpassungsregeln, Dokumentation.")
-    add("6", "6.6", "Gibt es Aktionspläne mit Maßnahmen, Budget, erwarteter Einsparung und Verifikationsmethode?",
-        "Nachweis: Maßnahmenportfolio, Business Cases, CAPEX/OPEX, M&V-Plan, Status.")
-
-    # 7 Support
-    add("7", "7.1", "Sind Ressourcen (Budget, Zeit, Messmittel, Personal) geplant und ausreichend?",
-        "Nachweis: Ressourcenplanung, Budgetfreigaben, Messkonzept, Rollen.")
-    add("7", "7.2", "Sind Kompetenzen festgelegt und Schulungen/Qualifikationen nachweisbar?",
-        "Nachweis: Schulungsplan, Nachweise, Unterweisungen, Lieferantenbriefings.")
-    add("7", "7.3", "Ist Awareness vorhanden (Energiepolitik, Ziele, Beitrag der Mitarbeitenden) und wird sie geprüft?",
-        "Nachweis: Kommunikation, Interviews, Kampagnen, Aushänge.")
-    add("7", "7.4", "Ist Kommunikation intern/extern geregelt (wer/was/wann/wie)?",
-        "Nachweis: Kommunikationsplan, Reportingzyklen, Eskalation.")
-    add("7", "7.5", "Ist dokumentierte Information gelenkt (Version, Freigabe, Zugriff, Aufbewahrung)?",
-        "Nachweis: Dokumentenlenkung, Ablagestruktur, Berechtigungen, Archiv.")
-
-    # 8 Operation
-    add("8", "8.1", "Sind operative Kriterien/Steuerungen für SEU (Setpoints, Laufzeiten, SOP) definiert und eingehalten?",
-        "Nachweis: SOP, BMS-Parameter, Änderungsprotokolle, Stichprobe.")
-    add("8", "8.1", "Werden Abweichungen im Betrieb erkannt und gesteuert (Alarme, Ausreißer, Fehlfunktionen)?",
-        "Nachweis: Alarmmanagement, Tickets, RCA, Maßnahmen.")
-    add("8", "8.2", "Wird energiebezogene Auslegung/Design bei Projekten berücksichtigt (Effizienz, Regelung, M&V)?",
-        "Nachweis: Projektchecklisten, Energieanforderungen, Abnahmen/Inbetriebnahme.")
-    add("8", "8.3", "Ist energiebezogene Beschaffung geregelt (Effizienzanforderungen, LCC/ROI)?",
-        "Nachweis: Einkaufsrichtlinie, Spezifikationen, Angebotsvergleiche.")
-    add("8", "8.3", "Werden energierelevante Dienstleister gesteuert und bewertet (FM, Wartung, Betrieb)?",
-        "Nachweis: SLA/Verträge, KPIs, Abnahmen, Fremdfirmenkoordination.")
-
-    # 9 Performance evaluation
-    add("9", "9.1.1", "Gibt es ein Mess- und Monitoringkonzept (Zählerstruktur, Datenpunkte, Frequenz, Owner) und ist es umgesetzt?",
-        "Nachweis: Messstellenplan, Zählerliste, BMS/Logger, Lückenanalyse, Verantwortliche.")
-    add("9", "9.1.1", "Sind Datenqualität und Plausibilisierung geregelt (Ausreißer/Fehlwerte/Korrekturen)?",
-        "Nachweis: Plausibilitätsregeln, Korrekturprotokolle, Beispiele.")
-    add("9", "9.1.2", "Wird Energieperformance anhand EnPI/EnB regelmäßig analysiert und berichtet?",
-        "Nachweis: Monatsreports, Abweichungsanalysen, Maßnahmenableitung.")
-    add("9", "9.2", "Sind interne Audits geplant und durchgeführt (Programm, Kriterien, Unabhängigkeit, Berichte, Maßnahmen)?",
-        "Nachweis: Auditprogramm, Auditorenqualifikation, Berichte, Maßnahmenverfolgung.")
-    add("9", "9.3", "Findet Managementbewertung statt inkl. Entscheidungen/Ressourcen?",
-        "Nachweis: Review-Protokoll, Beschlüsse, Ziel-/EnPI-Anpassungen.")
-
-    # 10 Improvement
-    add("10", "10.2", "Werden Nichtkonformitäten inkl. Korrekturmaßnahmen systematisch bearbeitet (Ursache, Umsetzung, Wirksamkeit)?",
-        "Nachweis: NCR/CAPA, RCA, Wirksamkeitsprüfung, Lessons learned.")
-    add("10", "10.3", "Ist kontinuierliche Verbesserung der Energieperformance nachweisbar (Trend/Einsparungen/Projekte)?",
-        "Nachweis: KPI-Trends, verifizierte Einsparungen, Projekte, M&V.")
-
-    # Hotel-Praxis
-    add("6", "6.3 (Hotel)", "Sind die größten Verbraucher (HVAC, Warmwasser, Küche, Wäscherei etc.) identifiziert und quantifiziert?",
-        "Nachweis: Top-Verbraucher, kWh-Anteile, Messwerte oder Schätzmethodik.")
-    add("8", "8.1 (Hotel)", "Sind Setpoints/Zeitschaltprogramme dokumentiert und gegen Komfort/Betrieb optimiert?",
-        "Nachweis: BMS-Screenshots, Änderungsprotokolle, Freigaben, Komfort-Abgleich.")
-    add("9", "9.1.1 (Hotel)", "Sind Zähler/Unterzähler so gesetzt, dass SEU separat bewertet werden können (Submetering)?",
-        "Nachweis: Zählerkonzept, Lücken, Maßnahmenplan.")
-
-    return q
-
-def build_questions_14001_detailed() -> List[Tuple[str, str, str, str, str]]:
-    q: List[Tuple[str, str, str, str, str]] = []
-    def add(chapter: str, clause: str, question: str, hint: str):
-        q.append(("ISO 14001", chapter, clause, question, hint))
-
-    # 4 Context
-    add("4", "4.1", "Ist der Kontext der Organisation (interne/externe Themen) für das UMS dokumentiert und aktuell?",
-        "Nachweis: Kontextanalyse, Markt/Behörden/Umweltrisiken, Standortbedingungen, Aktualisierung.")
-    add("4", "4.2", "Sind interessierte Parteien und deren umweltbezogene Anforderungen ermittelt/bewertet?",
-        "Nachweis: Stakeholderliste, Anforderungen (Behörden, Gäste, Eigentümer, Lieferanten), Review.")
-    add("4", "4.3", "Ist der Geltungsbereich des UMS definiert (Standorte/Prozesse) inkl. Abgrenzungen?",
-        "Nachweis: Scope-Dokument, Schnittstellen/Outsourcing.")
-    add("4", "4.4", "Sind UMS-Prozesse beschrieben (Wechselwirkungen, Verantwortlichkeiten, Dokumentation)?",
-        "Nachweis: Prozesslandkarte, Verfahren, Rollen/RACI.")
-
-    # 5 Leadership
-    add("5", "5.1", "Ist Management-Commitment nachweisbar (Ressourcen, Ziele, Reviews, Entscheidungen)?",
-        "Nachweis: Managementreview, Ressourcenfreigaben, Beschlüsse.")
-    add("5", "5.2", "Gibt es eine Umweltpolitik (Schutz der Umwelt, Compliance, kontinuierliche Verbesserung) und ist sie kommuniziert?",
-        "Nachweis: Politik, Freigabe/Version, Kommunikation/Aushang.")
-    add("5", "5.3", "Sind Rollen/Verantwortlichkeiten im UMS festgelegt und bekannt?",
-        "Nachweis: Organigramm, Rollenbeschreibungen, Interview-Stichprobe.")
-
-    # 6 Planning
-    add("6", "6.1.1", "Sind Risiken/Chancen (UMS) ermittelt und in Maßnahmen überführt?",
-        "Nachweis: Risiko-/Chancenliste, Priorisierung, Maßnahmenplan.")
-    add("6", "6.1.2", "Sind Umweltaspekte (normal/abnormal/Notfall) identifiziert, bewertet und aktuell?",
-        "Nachweis: Aspektebewertung (z.B. Energie, Wasser, Abfall, Chemie, Lärm), Kriterien, Review.")
-    add("6", "6.1.3", "Sind bindende Verpflichtungen (Gesetze, Auflagen, Verträge) identifiziert und bewertet?",
-        "Nachweis: Rechtskataster, Genehmigungen, Auflagen, Prüf-/Nachweisführung.")
-    add("6", "6.1.4", "Ist geplant, wie UMS-Prozesse/Aspekte gesteuert werden (inkl. Notfallvorsorge)?",
-        "Nachweis: Steuerungsmaßnahmen, Notfallplanung, Übungen.")
-    add("6", "6.2", "Sind Umweltziele/Programme SMART definiert, mit Verantwortlichen/Terminen/Monitoring?",
-        "Nachweis: Zielmatrix, Programme, KPI, Statusberichte.")
-
-    # 7 Support
-    add("7", "7.2", "Sind Kompetenzanforderungen festgelegt und Schulungen/Unterweisungen nachweisbar?",
-        "Nachweis: Schulungsplan, Nachweise, Unterweisungen (z.B. Gefahrstoffe, Abfalltrennung).")
-    add("7", "7.3", "Ist Awareness vorhanden (Politik, Aspekte, Notfälle) und wird sie geprüft?",
-        "Nachweis: Kommunikation, Interviews, Aushänge.")
-    add("7", "7.4", "Ist Kommunikation (intern/extern) geregelt, inkl. Behördenkommunikation?",
-        "Nachweis: Kommunikationsplan, Meldewege, Verantwortliche.")
-    add("7", "7.5", "Ist dokumentierte Information gelenkt (Version, Zugriff, Aufbewahrung)?",
-        "Nachweis: Dokumentenlenkung, Ablage, Archiv.")
-
-    # 8 Operation
-    add("8", "8.1", "Sind operative Steuerungen für wesentliche Umweltaspekte definiert und wirksam?",
-        "Nachweis: SOPs (Abfall, Chemie, Lagerung), Kontrollen, Checklisten, Fremdfirmen.")
-    add("8", "8.1", "Werden Lieferanten/Dienstleister umweltbezogen gesteuert (Anforderungen, Kontrollen)?",
-        "Nachweis: Verträge/SLA, Briefings, Nachweise, Stichprobe Fremdfirma.")
-    add("8", "8.2", "Ist Notfallvorsorge/Reaktion geplant, umgesetzt und geübt (z.B. Leckage, Brand, Chemie)?",
-        "Nachweis: Notfallpläne, Übungen, Protokolle, Verbesserungen.")
-
-    # 9 Performance evaluation
-    add("9", "9.1.1", "Werden relevante Umweltkennzahlen überwacht und bewertet (z.B. Abfallmengen, Wasser, Chemie, Energie)?",
-        "Nachweis: KPI-Set, Monitoring, Trends, Abweichungsanalysen.")
-    add("9", "9.1.2", "Wird die Compliance mit bindenden Verpflichtungen regelmäßig bewertet?",
-        "Nachweis: Compliance-Bewertung, Prüfplan, Nachweise, Maßnahmen.")
-    add("9", "9.2", "Sind interne Audits geplant/durchgeführt (Programm, Kriterien, Unabhängigkeit, Berichte)?",
-        "Nachweis: Auditprogramm, Berichte, Maßnahmenverfolgung.")
-    add("9", "9.3", "Findet Managementreview statt inkl. Entscheidungen/Ressourcen?",
-        "Nachweis: Review-Protokoll, Beschlüsse, Zielanpassungen.")
-
-    # 10 Improvement
-    add("10", "10.2", "Werden Nichtkonformitäten/Korrekturmaßnahmen systematisch behandelt (Ursache, Umsetzung, Wirksamkeit)?",
-        "Nachweis: NCR/CAPA, RCA, Wirksamkeitscheck.")
-    add("10", "10.3", "Ist kontinuierliche Verbesserung des UMS nachweisbar (Trends, Projekte, Wirksamkeit)?",
-        "Nachweis: Verbesserungsmaßnahmen, KPI-Trends, Lessons learned.")
-
-    # Hotel-Praxis
-    add("8", "8.1 (Hotel)", "Ist Abfallmanagement geregelt (Trennung, Lagerung, Entsorgung, Nachweise, Speiseabfälle)?",
-        "Nachweis: Entsorgungsverträge, Wiegescheine, Lagerstellen, Schulungen, Kontrollen.")
-    add("8", "8.1 (Hotel)", "Ist Gefahrstoffmanagement geregelt (SDS, Lagerung, Kennzeichnung, Unterweisung, Inventar)?",
-        "Nachweis: Gefahrstoffkataster, SDS, Lager-Check, Unterweisung, PSA.")
-    add("8", "8.1 (Hotel)", "Ist Abwassermanagement angemessen (z.B. Fettabscheider Betrieb/Entsorgung/Nachweise)?",
-        "Nachweis: Wartungs-/Entsorgungsnachweise, Intervalle, Störfälle, Betreiberpflichten.")
-
-    return q
-
-def build_questions_45001_detailed() -> List[Tuple[str, str, str, str, str]]:
-    q: List[Tuple[str, str, str, str, str]] = []
-    def add(chapter: str, clause: str, question: str, hint: str):
-        q.append(("ISO 45001", chapter, clause, question, hint))
-
-    # 4 Context
-    add("4", "4.1", "Ist der Kontext der Organisation für Arbeitsschutz (interne/externe Themen) dokumentiert und aktuell?",
-        "Nachweis: Kontextanalyse, Unfall-/Beinaheunfalltrends, Fremdfirmenanteil, Standortbedingungen.")
-    add("4", "4.2", "Sind interessierte Parteien und deren Anforderungen zum SGA ermittelt/bewertet (Behörden, BG, Mitarbeitende)?",
-        "Nachweis: Stakeholderliste, Anforderungen, Review.")
-    add("4", "4.3", "Ist der Geltungsbereich des SGA eindeutig definiert (Standorte/Prozesse, Fremdfirmen)?",
-        "Nachweis: Scope, Outsourcing-Schnittstellen, Verantwortlichkeiten.")
-    add("4", "4.4", "Sind SGA-Prozesse dokumentiert (Wechselwirkungen, Verantwortlichkeiten, Dokumentation)?",
-        "Nachweis: Prozesslandkarte, Verfahren, Rollen/RACI.")
-
-    # 5 Leadership
-    add("5", "5.1", "Ist Management-Commitment nachweisbar (Ressourcen, Ziele, Begehungen, Entscheidungen)?",
-        "Nachweis: Managementreview, Sicherheitsrundgänge, Ressourcenfreigaben.")
-    add("5", "5.2", "Gibt es eine Arbeitsschutzpolitik und ist sie kommuniziert/verstanden?",
-        "Nachweis: Politik, Aushang, Kommunikation, Interview.")
-    add("5", "5.4", "Sind Beteiligung und Konsultation der Beschäftigten geregelt und umgesetzt?",
-        "Nachweis: ASA-Protokolle, Feedbackkanäle, Sicherheitsbeauftragte, Maßnahmen.")
-
-    # 6 Planning
-    add("6", "6.1.1", "Sind Risiken/Chancen im SGA identifiziert, bewertet und in Maßnahmen überführt?",
-        "Nachweis: Risiko-/Chancenliste, Maßnahmenplan, Owner/Fristen.")
-    add("6", "6.1.2", "Ist die Gefährdungsbeurteilung vorhanden, aktuell und deckt Tätigkeiten/Arbeitsmittel ab?",
-        "Nachweis: GBU je Bereich (Technik/Housekeeping/Küche), Aktualisierungen, Beteiligung.")
-    add("6", "6.1.2", "Werden Änderungen (Umbau, neue Anlagen/Arbeitsmittel) im Change-Management in der GBU berücksichtigt?",
-        "Nachweis: Änderungsprozess, Aktualisierung GBU, Unterweisung vor Inbetriebnahme.")
-    add("6", "6.1.3", "Sind bindende Verpflichtungen (Gesetze, DGUV, BetrSichV etc.) identifiziert und bewertet?",
-        "Nachweis: Rechtskataster, Prüfpläne, Betreiberpflichten, Nachweise.")
-    add("6", "6.2", "Sind Arbeitsschutzziele SMART definiert (z.B. Unfallquote, Begehungen, Unterweisungen) und überwacht?",
-        "Nachweis: Zielmatrix, KPI, Reports, Maßnahmen.")
-
-    # 7 Support
-    add("7", "7.2", "Sind Kompetenzanforderungen festgelegt und Qualifikation/Unterweisung nachweisbar?",
-        "Nachweis: Unterweisungsnachweise, Qualifikationen (z.B. Elektro, Kälte), Schulungsplan.")
-    add("7", "7.3", "Ist Awareness vorhanden (Politik, Risiken, Meldesystem) und wird sie geprüft?",
-        "Nachweis: Kommunikation, Interviews, Meldewege.")
-    add("7", "7.4", "Ist Kommunikation intern/extern geregelt (BG/Behörden/Notfälle)?",
-        "Nachweis: Kommunikationsplan, Notfallkontakte, Meldeprozesse.")
-    add("7", "7.5", "Ist dokumentierte Information gelenkt (Version, Zugriff, Aufbewahrung)?",
-        "Nachweis: Dokumentenlenkung, Archiv, Zugriffsrechte.")
-
-    # 8 Operation
-    add("8", "8.1.1", "Sind operative Steuerungen implementiert (SOP, PSA, sichere Arbeitsverfahren) und werden sie eingehalten?",
-        "Nachweis: Arbeitsanweisungen, PSA-Ausgabe, Kontrollen, Begehungen.")
-    add("8", "8.1.2", "Ist Hierarchie der Maßnahmen (Substitution, Technik, Organisation, PSA) angewandt und nachvollziehbar?",
-        "Nachweis: Maßnahmen aus GBU, Wirksamkeitsnachweise, Dokumentation.")
-    add("8", "8.1.3", "Sind Beschaffung und Auftragnehmersteuerung (Fremdfirmen) geregelt und wirksam?",
-        "Nachweis: Fremdfirmenprozess, Unterweisung, Erlaubnisscheine, Kontrollen.")
-    add("8", "8.1.4", "Ist Notfallvorsorge/Reaktion geregelt (Erste Hilfe, Brand, Evakuierung, Chemie)?",
-        "Nachweis: Notfallpläne, Übungen, Ersthelferliste, Protokolle.")
-
-    # 9 Performance evaluation
-    add("9", "9.1", "Werden Arbeitsschutz-Kennzahlen überwacht (Unfälle, Beinaheunfälle, Begehungen, Unterweisungen)?",
-        "Nachweis: KPI-Reports, Trendanalysen, Maßnahmen.")
-    add("9", "9.2", "Sind interne Audits geplant und durchgeführt (Programm, Kriterien, Unabhängigkeit)?",
-        "Nachweis: Auditprogramm, Berichte, Maßnahmenverfolgung.")
-    add("9", "9.3", "Findet Managementreview statt inkl. Entscheidungen/Ressourcen?",
-        "Nachweis: Review-Protokoll, Beschlüsse, Zielanpassung.")
-
-    # 10 Improvement
-    add("10", "10.2", "Werden Vorfälle/Nichtkonformitäten inkl. Ursachenanalyse, Korrekturmaßnahmen und Wirksamkeitsprüfung behandelt?",
-        "Nachweis: Unfallberichte, RCA, CAPA, Wirksamkeitscheck.")
-    add("10", "10.3", "Ist kontinuierliche Verbesserung nachweisbar (Lessons learned, Maßnahmen, KPI-Trends)?",
-        "Nachweis: Verbesserungsmaßnahmen, KPI-Trends, Review-Beschlüsse.")
-
-    # Hotel-Praxis
-    add("8", "8.1.3 (Hotel)", "Ist der Fremdfirmenprozess robust (Einweisung, Freigabe, Aufsicht, Dokumentation)?",
-        "Nachweis: Fremdfirmenunterweisung, Arbeitsfreigaben, Koordination, Stichprobe.")
-    add("6", "6.1.2 (Hotel)", "Deckt die GBU typische Hoteltätigkeiten ab (Housekeeping, Küche, Technik, Empfang)?",
-        "Nachweis: GBU-Katalog, Aktualisierung, Maßnahmenumsetzung.")
-    add("8", "8.1.1 (Hotel)", "Sind Prüfpflichten für Arbeitsmittel/Anlagen organisiert (Leitern, elektrische Betriebsmittel, PSA, Aufzüge)?",
-        "Nachweis: Prüfplan, Prüfnachweise, Mängelverfolgung.")
-
-    return q
-
-def build_default_questions() -> List[Tuple[str, str, Optional[str], str, str]]:
-    questions: List[Tuple[str, str, Optional[str], str, str]] = []
-
-    # ISO 9001 (kurzer Start – kannst du später ebenfalls detaillieren)
-    questions += [
-        ("ISO 9001","4","4.1","Sind Kontext und interessierte Parteien bestimmt und dokumentiert?",
-         "Nachweis: Kontextanalyse, Stakeholderliste, Scope, Prozessübersicht."),
-        ("ISO 9001","5","5.1","Sind Rollen/Verantwortlichkeiten und Qualitäts-Politik festgelegt und kommuniziert?",
-         "Nachweis: Politik, Organigramm, Verantwortlichkeiten, Kommunikation."),
-        ("ISO 9001","6","6.1","Sind Risiken/Chancen bewertet und Qualitätsziele geplant?",
-         "Nachweis: Risiko-/Chancenliste, Zielmatrix, Maßnahmenplan."),
-        ("ISO 9001","7","7.2","Sind Kompetenzen/Schulungen nachweisbar und Dokumente gelenkt?",
-         "Nachweis: Schulungsnachweise, Dokumentenlenkung, Versionsstände."),
-        ("ISO 9001","8","8.1","Sind Prozesse definiert, umgesetzt und überwacht (inkl. Outsourcing)?",
-         "Nachweis: Prozessbeschreibungen, KPIs, Lieferantensteuerung."),
-        ("ISO 9001","9","9.1","Werden Kennzahlen geprüft und Managementbewertungen durchgeführt?",
-         "Nachweis: KPI-Reports, Managementreview-Protokolle."),
-        ("ISO 9001","10","10.2","Werden Abweichungen, Korrekturmaßnahmen und KVP wirksam umgesetzt?",
-         "Nachweis: NCR/CAPA, Ursachenanalyse, Wirksamkeitsprüfung."),
-    ]
-
-    # Detaillierte Kataloge
-    questions += build_questions_50001_detailed()
-    questions += build_questions_14001_detailed()
-    questions += build_questions_45001_detailed()
-    return questions
-
-
-# ---------------------------
-# Data Access
+# Data access
 # ---------------------------
 def get_hotels() -> pd.DataFrame:
     conn = db()
@@ -706,31 +661,23 @@ def upsert_user(email, name, role, hotel_code, password_plain: Optional[str], is
 def select_hotel_filter(hotels_df: pd.DataFrame) -> Optional[str]:
     u = st.session_state.get("user")
     labels = hotel_label_map(hotels_df)
-
     if u["role"] in ("Direktor", "Techniker"):
         return u["hotel_code"]
-
     options = ["Alle"] + hotels_df["code"].tolist()
-    def fmt(x):
-        return "Alle" if x == "Alle" else labels.get(x, x)
-
-    sel = st.selectbox("Hotel-Filter", options, index=0, format_func=fmt)
+    sel = st.selectbox("Hotel-Filter", options, index=0, format_func=lambda x: "Alle" if x == "Alle" else labels.get(x, x))
     return None if sel == "Alle" else sel
 
 
 # ---------------------------
-# Compliance
+# Betreiberpflichten
 # ---------------------------
 def compliance_df(hotel_code: Optional[str]=None) -> pd.DataFrame:
     conn = db()
     if hotel_code:
-        df = pd.read_sql_query("""
-            SELECT * FROM compliance_items WHERE hotel_code=? ORDER BY next_date IS NULL, next_date, asset
-        """, conn, params=(hotel_code,))
+        df = pd.read_sql_query("SELECT * FROM compliance_items WHERE hotel_code=? ORDER BY next_date IS NULL, next_date, asset",
+                               conn, params=(hotel_code,))
     else:
-        df = pd.read_sql_query("""
-            SELECT * FROM compliance_items ORDER BY hotel_code, next_date IS NULL, next_date, asset
-        """, conn)
+        df = pd.read_sql_query("SELECT * FROM compliance_items ORDER BY hotel_code, next_date IS NULL, next_date, asset", conn)
     conn.close()
     return df
 
@@ -744,8 +691,7 @@ def compliance_kpis(hotel_code: Optional[str]=None, warn_days=30):
             statuses["—"] += 1
             continue
         days = (nd - td).days
-        s = status_from_days(days, warn_days=warn_days)
-        statuses[s] += 1
+        statuses[status_from_days(days, warn_days=warn_days)] += 1
     return statuses, len(df)
 
 def update_compliance_item(item_id: int, interval_months: int, last_date_str: Optional[str],
@@ -810,12 +756,18 @@ def list_audits(hotel_code: Optional[str]=None) -> pd.DataFrame:
     conn.close()
     return df
 
+def get_audit_by_id(audit_id: int) -> Dict:
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM audits WHERE id=?", (audit_id,))
+    r = cur.fetchone()
+    conn.close()
+    return dict(r) if r else {}
+
 def ensure_audit_answers(audit_id: int, norm: str):
-    """Ensure answer rows exist for all active questions (important after catalog updates)."""
     conn = db()
     cur = conn.cursor()
     now = utc_now_iso()
-
     cur.execute("SELECT id FROM audit_questions WHERE norm=? AND is_active=1", (norm,))
     qids = [row["id"] for row in cur.fetchall()]
     for qid in qids:
@@ -823,7 +775,6 @@ def ensure_audit_answers(audit_id: int, norm: str):
             INSERT OR IGNORE INTO audit_answers(audit_id,question_id,score,deviation,deviation_type,evidence,notes,updated_at)
             VALUES (?,?,?,?,?,?,?,?)
         """, (audit_id, qid, "", "", "", "", "", now))
-
     conn.commit()
     conn.close()
 
@@ -839,17 +790,8 @@ def create_audit(hotel_code, norm, area, auditor_name, audit_date_str, status):
     audit_id = cur.lastrowid
     conn.commit()
     conn.close()
-
     ensure_audit_answers(audit_id, norm)
     return acode
-
-def get_audit(audit_id: int) -> Dict:
-    conn = db()
-    cur = conn.cursor()
-    cur.execute("SELECT * FROM audits WHERE id=?", (audit_id,))
-    r = cur.fetchone()
-    conn.close()
-    return dict(r) if r else {}
 
 def audit_questions_answers(audit_id: int) -> pd.DataFrame:
     conn = db()
@@ -870,11 +812,8 @@ def update_audit_answer(answer_id: int, score: str, deviation: str, deviation_ty
     conn = db()
     cur = conn.cursor()
     now = utc_now_iso()
-
-    # Wenn deviation != Ja → deviation_type leeren
     if deviation != "Ja":
         deviation_type = ""
-
     cur.execute("""
         UPDATE audit_answers
         SET score=?, deviation=?, deviation_type=?, evidence=?, notes=?, updated_at=?
@@ -885,10 +824,7 @@ def update_audit_answer(answer_id: int, score: str, deviation: str, deviation_ty
 
 def recompute_audit_score(audit_id: int) -> Optional[float]:
     df = audit_questions_answers(audit_id)
-    vals = []
-    for s in df["score"].tolist():
-        if s in ("0","1","2"):
-            vals.append(int(s))
+    vals = [int(s) for s in df["score"].tolist() if s in ("0","1","2")]
     score = round(sum(vals)/len(vals), 2) if vals else None
     conn = db()
     cur = conn.cursor()
@@ -910,10 +846,21 @@ def update_audit_meta(audit_id: int, status: str, audit_date_str: Optional[str],
     conn.commit()
     conn.close()
 
+def delete_audit(audit_id: int):
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM audits WHERE id=?", (audit_id,))
+    conn.commit()
+    conn.close()
+
 
 # ---------------------------
-# Actions
+# Maßnahmen
 # ---------------------------
+ACTION_STATUSES = ["Offen", "In Bearbeitung", "Wirksamkeit offen", "Erledigt"]
+ACTION_CATEGORIES = ["Major", "Minor", "Beobachtung", "Verbesserung"]
+RISK_LEVELS = ["", "Niedrig", "Mittel", "Hoch"]
+
 def list_actions(hotel_code: Optional[str]=None) -> pd.DataFrame:
     conn = db()
     if hotel_code:
@@ -934,26 +881,41 @@ def list_actions(hotel_code: Optional[str]=None) -> pd.DataFrame:
     conn.close()
     return df
 
-def create_action(hotel_code, audit_id, title, category, owner_name, due_date_str, status, notes):
+def create_action(hotel_code, audit_id, title, category, owner_name, due_date_str, status,
+                  notes="", risk_level="", immediate_action="", root_cause="", corrective_action=""):
     conn = db()
     cur = conn.cursor()
     now = utc_now_iso()
     cur.execute("""
-        INSERT INTO actions(hotel_code,audit_id,title,category,owner_name,due_date,status,effectiveness_date,notes,created_at,updated_at)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?)
-    """, (hotel_code, audit_id, title, category, owner_name, due_date_str or None, status, None, notes, now, now))
+        INSERT INTO actions(
+          hotel_code,audit_id,title,category,owner_name,due_date,status,
+          effectiveness_date,effectiveness_result,risk_level,immediate_action,root_cause,corrective_action,
+          notes,created_at,updated_at
+        )
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+    """, (hotel_code, audit_id, title, category, owner_name, due_date_str or None, status,
+          None, None, risk_level, immediate_action, root_cause, corrective_action,
+          notes, now, now))
     conn.commit()
     conn.close()
 
-def update_action(action_id: int, title, category, owner_name, due_date_str, status, effectiveness_date_str, notes):
+def update_action(action_id: int, title, category, owner_name, due_date_str, status,
+                  effectiveness_date_str, effectiveness_result,
+                  risk_level, immediate_action, root_cause, corrective_action, notes):
     conn = db()
     cur = conn.cursor()
     now = utc_now_iso()
     cur.execute("""
         UPDATE actions
-        SET title=?, category=?, owner_name=?, due_date=?, status=?, effectiveness_date=?, notes=?, updated_at=?
+        SET title=?, category=?, owner_name=?, due_date=?, status=?,
+            effectiveness_date=?, effectiveness_result=?,
+            risk_level=?, immediate_action=?, root_cause=?, corrective_action=?,
+            notes=?, updated_at=?
         WHERE id=?
-    """, (title, category, owner_name, due_date_str or None, status, effectiveness_date_str or None, notes, now, action_id))
+    """, (title, category, owner_name, due_date_str or None, status,
+          effectiveness_date_str or None, effectiveness_result or None,
+          risk_level, immediate_action, root_cause, corrective_action,
+          notes, now, action_id))
     conn.commit()
     conn.close()
 
@@ -961,6 +923,53 @@ def delete_action(action_id: int):
     conn = db()
     cur = conn.cursor()
     cur.execute("DELETE FROM actions WHERE id=?", (action_id,))
+    conn.commit()
+    conn.close()
+
+
+# ---------------------------
+# Auditprogramm
+# ---------------------------
+PROGRAM_STATUSES = ["Geplant", "Durchgeführt", "Abgesagt"]
+
+def list_program(hotel_code: Optional[str]=None) -> pd.DataFrame:
+    conn = db()
+    if hotel_code:
+        df = pd.read_sql_query("""
+            SELECT * FROM audit_program WHERE hotel_code=?
+            ORDER BY planned_date, norm, area
+        """, conn, params=(hotel_code,))
+    else:
+        df = pd.read_sql_query("""
+            SELECT * FROM audit_program
+            ORDER BY planned_date, hotel_code, norm, area
+        """, conn)
+    conn.close()
+    return df
+
+def upsert_program_row(row_id: Optional[int], hotel_code, norm, area, planned_date_str, owner_name,
+                      status, reminder_days, notes):
+    conn = db()
+    cur = conn.cursor()
+    now = utc_now_iso()
+    if row_id:
+        cur.execute("""
+            UPDATE audit_program
+            SET hotel_code=?, norm=?, area=?, planned_date=?, owner_name=?, status=?, reminder_days=?, notes=?, updated_at=?
+            WHERE id=?
+        """, (hotel_code, norm, area, planned_date_str, owner_name, status, int(reminder_days), notes, now, int(row_id)))
+    else:
+        cur.execute("""
+            INSERT INTO audit_program(hotel_code,norm,area,planned_date,owner_name,status,reminder_days,notes,created_at,updated_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?)
+        """, (hotel_code, norm, area, planned_date_str, owner_name, status, int(reminder_days), notes, now, now))
+    conn.commit()
+    conn.close()
+
+def delete_program_row(row_id: int):
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM audit_program WHERE id=?", (row_id,))
     conn.commit()
     conn.close()
 
@@ -1042,12 +1051,11 @@ def attachments_list_ui(hotel_code: str, entity_type: str, entity_id: int):
 
 
 # ---------------------------
-# PDF Export (Audit Report)
+# PDF Export
 # ---------------------------
 def wrap_text(text: str, max_chars: int) -> List[str]:
     words = (text or "").split()
-    lines = []
-    line = ""
+    lines, line = [], ""
     for w in words:
         if len(line) + len(w) + 1 <= max_chars:
             line = (line + " " + w).strip()
@@ -1090,8 +1098,7 @@ def make_audit_pdf(audit: Dict, dfq: pd.DataFrame, hotel_name: str) -> bytes:
     c.drawString(20*mm, y, "Zusammenfassung")
     y -= 6*mm
     c.setFont("Helvetica", 10)
-    summary = audit.get("summary") or ""
-    for line in wrap_text(summary, 95):
+    for line in wrap_text(audit.get("summary") or "", 95):
         c.drawString(20*mm, y, line)
         y -= 5*mm
         if y < 20*mm:
@@ -1107,7 +1114,7 @@ def make_audit_pdf(audit: Dict, dfq: pd.DataFrame, hotel_name: str) -> bytes:
     c.setFont("Helvetica-Bold", 9)
     c.drawString(20*mm, y, "Clause")
     c.drawString(40*mm, y, "Bew.")
-    c.drawString(55*mm, y, "Abw.")
+    c.drawString(55*mm, y, "Typ")
     c.drawString(70*mm, y, "Frage (gekürzt)")
     y -= 5*mm
     c.setFont("Helvetica", 9)
@@ -1115,11 +1122,11 @@ def make_audit_pdf(audit: Dict, dfq: pd.DataFrame, hotel_name: str) -> bytes:
     for _, row in dfq.iterrows():
         clause = (row.get("clause") or row.get("chapter") or "")
         sc = row.get("score") or ""
-        dv = row.get("deviation_type") if (row.get("deviation") == "Ja") else ""
+        dtype = (row.get("deviation_type") or "") if (row.get("deviation") == "Ja") else ""
         qtext = (row.get("question") or "")[:120]
         c.drawString(20*mm, y, str(clause))
         c.drawString(40*mm, y, sc)
-        c.drawString(55*mm, y, (dv or ""))
+        c.drawString(55*mm, y, dtype)
         for line in wrap_text(qtext, 70):
             c.drawString(70*mm, y, line)
             y -= 4.5*mm
@@ -1136,7 +1143,7 @@ def make_audit_pdf(audit: Dict, dfq: pd.DataFrame, hotel_name: str) -> bytes:
 
 
 # ---------------------------
-# Notifications (Outlook via Graph, Teams via Webhook)
+# Notifications (Graph / Teams)
 # ---------------------------
 _graph_token_cache = {"token": None, "expires_at": 0}
 
@@ -1146,7 +1153,6 @@ def graph_get_token() -> Optional[str]:
     now = int(datetime.utcnow().timestamp())
     if _graph_token_cache["token"] and now < _graph_token_cache["expires_at"] - 60:
         return _graph_token_cache["token"]
-
     url = f"https://login.microsoftonline.com/{MS_TENANT_ID}/oauth2/v2.0/token"
     data = {
         "client_id": MS_CLIENT_ID,
@@ -1168,7 +1174,6 @@ def graph_send_mail(to_emails: List[str], subject: str, html_body: str) -> bool:
     token = graph_get_token()
     if not token or not MAIL_SENDER_UPN:
         return False
-
     url = f"https://graph.microsoft.com/v1.0/users/{MAIL_SENDER_UPN}/sendMail"
     payload = {
         "message": {
@@ -1196,10 +1201,6 @@ def teams_post_message(title: str, text: str) -> bool:
     r = requests.post(TEAMS_WEBHOOK_URL, json=payload, timeout=20)
     return r.status_code in (200, 201)
 
-
-# ---------------------------
-# Digests
-# ---------------------------
 def compliance_digest(hotel_code: Optional[str], warn_days: int) -> Dict:
     df = compliance_df(hotel_code)
     td = today()
@@ -1212,13 +1213,8 @@ def compliance_digest(hotel_code: Optional[str], warn_days: int) -> Dict:
         stt = status_from_days(days, warn_days=warn_days)
         if stt in ("Überfällig", "Fällig", "Bald fällig"):
             items.append({
-                "hotel": r["hotel_code"],
-                "asset": r["asset"],
-                "task": r["task"],
-                "next": nd,
-                "days": days,
-                "status": stt,
-                "owner": r["owner_name"] or ""
+                "hotel": r["hotel_code"], "asset": r["asset"], "task": r["task"],
+                "next": nd, "days": days, "status": stt, "owner": r["owner_name"] or ""
             })
     items.sort(key=lambda x: (severity_rank(x["status"]), x["days"], x["hotel"], x["asset"]))
     return {"items": items, "count": len(items)}
@@ -1241,16 +1237,36 @@ def actions_digest(hotel_code: Optional[str]) -> Dict:
                 "overdue": overdue,
                 "status": r["status"],
                 "owner": r["owner_name"] or "",
-                "audit_code": r.get("audit_code") or ""
+                "audit_code": r.get("audit_code") or "",
             })
     items.sort(key=lambda x: (0 if x["overdue"] else 1, x["due"] or date(2999,1,1)))
     return {"items": items, "count": len(items)}
 
+def program_digest(hotel_code: Optional[str], days_ahead: int = 30) -> Dict:
+    df = list_program(hotel_code)
+    td = today()
+    items = []
+    for _, r in df.iterrows():
+        if r["status"] != "Geplant":
+            continue
+        pd_ = parse_date(r["planned_date"])
+        if not pd_:
+            continue
+        delta = (pd_ - td).days
+        if delta < 0 or delta <= days_ahead:
+            items.append({
+                "hotel": r["hotel_code"], "norm": r["norm"], "area": r["area"],
+                "planned": pd_, "days": delta, "owner": r["owner_name"] or "", "reminder_days": int(r["reminder_days"] or 14)
+            })
+    items.sort(key=lambda x: (0 if x["days"] < 0 else 1, x["days"], x["hotel"], x["norm"]))
+    return {"items": items, "count": len(items)}
+
 def send_digest(to_emails: List[str], hotel_filter: Optional[str], warn_days: int,
-                send_mail: bool, send_teams: bool, hotels_df: pd.DataFrame) -> Dict[str, bool]:
+                days_ahead_program: int, send_mail: bool, send_teams: bool, hotels_df: pd.DataFrame) -> Dict[str, bool]:
     labels = hotel_label_map(hotels_df)
     comp = compliance_digest(hotel_filter, warn_days)
     acts = actions_digest(hotel_filter)
+    prog = program_digest(hotel_filter, days_ahead_program)
 
     title = f"Audit/Compliance Digest – {fmt_date(today())}"
     scope = "Alle Hotels" if not hotel_filter else labels.get(hotel_filter, hotel_filter)
@@ -1261,53 +1277,56 @@ def send_digest(to_emails: List[str], hotel_filter: Optional[str], warn_days: in
     <h2>{title}</h2>
     <p><b>{scope}</b></p>
     {link_hint}
-    <h3>Betreiberpflichten (Überfällig/Fällig/Bald fällig): {comp['count']}</h3>
+    <h3>Auditprogramm (Geplant / fällig): {prog['count']}</h3>
     <ul>
     """
+    for it in prog["items"][:40]:
+        state = "Überfällig" if it["days"] < 0 else f"in {it['days']} Tagen"
+        html += f"<li><b>{labels.get(it['hotel'], it['hotel'])}</b> – {it['norm']} – {it['area']} – <b>{fmt_date(it['planned'])}</b> ({state})</li>"
+    html += "</ul>"
+
+    html += f"<h3>Betreiberpflichten (Überfällig/Fällig/Bald fällig): {comp['count']}</h3><ul>"
     for it in comp["items"][:40]:
         html += (
             f"<li><b>{labels.get(it['hotel'], it['hotel'])}</b> – "
             f"{it['asset']} / {it['task']} – <b>{it['status']}</b> – "
-            f"{fmt_date(it['next'])} ({it['days']} Tage) "
-            f"{('– Owner: '+it['owner']) if it['owner'] else ''}</li>"
+            f"{fmt_date(it['next'])} ({it['days']} Tage)</li>"
         )
     html += "</ul>"
+
     html += f"<h3>Offene Maßnahmen: {acts['count']}</h3><ul>"
     for it in acts["items"][:40]:
-        due = fmt_date(it["due"])
         flag = "🚨" if it["overdue"] else "⏳"
-        html += (
-            f"<li>{flag} <b>{labels.get(it['hotel'], it['hotel'])}</b> – "
-            f"[{it['category']}] {it['title']} – Frist: <b>{due}</b> – "
-            f"Status: {it['status']} {('– Owner: '+it['owner']) if it['owner'] else ''}</li>"
-        )
+        html += f"<li>{flag} <b>{labels.get(it['hotel'], it['hotel'])}</b> – [{it['category']}] {it['title']} – Frist: <b>{fmt_date(it['due'])}</b> – Status: {it['status']}</li>"
     html += "</ul></body></html>"
 
-    t = f"**{title}**\n\n**{scope}**\n\n"
-    t += f"**Betreiberpflichten fällig:** {comp['count']}\n"
+    text = f"**{title}**\n\n**{scope}**\n\n"
+    text += f"**Auditprogramm (fällig):** {prog['count']}\n"
+    for it in prog["items"][:20]:
+        state = "Überfällig" if it["days"] < 0 else f"in {it['days']} Tagen"
+        text += f"- **{labels.get(it['hotel'], it['hotel'])}** {it['norm']} – {it['area']} → **{fmt_date(it['planned'])}** ({state})\n"
+    text += f"\n**Betreiberpflichten fällig:** {comp['count']}\n"
     for it in comp["items"][:20]:
-        t += f"- **{labels.get(it['hotel'], it['hotel'])}** {it['asset']} / {it['task']} → **{it['status']}** ({fmt_date(it['next'])}, {it['days']} Tage)\n"
-    t += f"\n**Offene Maßnahmen:** {acts['count']}\n"
+        text += f"- **{labels.get(it['hotel'], it['hotel'])}** {it['asset']} / {it['task']} → **{it['status']}** ({fmt_date(it['next'])})\n"
+    text += f"\n**Offene Maßnahmen:** {acts['count']}\n"
     for it in acts["items"][:20]:
-        due = fmt_date(it["due"])
         flag = "🚨" if it["overdue"] else "⏳"
-        t += f"- {flag} **{labels.get(it['hotel'], it['hotel'])}** [{it['category']}] {it['title']} → Frist **{due}**\n"
+        text += f"- {flag} **{labels.get(it['hotel'], it['hotel'])}** [{it['category']}] {it['title']} → Frist **{fmt_date(it['due'])}**\n"
     if APP_BASE_URL:
-        t += f"\nApp: {APP_BASE_URL}"
+        text += f"\nApp: {APP_BASE_URL}"
 
     out = {"mail": False, "teams": False}
     if send_mail:
         out["mail"] = graph_send_mail(to_emails, title, html)
     if send_teams:
-        out["teams"] = teams_post_message(title, t)
+        out["teams"] = teams_post_message(title, text)
     return out
 
 
 # ---------------------------
-# Audit Questions Management
+# Fragenkatalog
 # ---------------------------
 def insert_questions_if_missing(questions: List[Tuple[str, str, Optional[str], str, str]]) -> int:
-    """Insert only missing questions by (norm, clause, question)."""
     conn = db()
     cur = conn.cursor()
     inserted = 0
@@ -1330,22 +1349,32 @@ def insert_questions_if_missing(questions: List[Tuple[str, str, Optional[str], s
 def list_audit_questions(norm: Optional[str]=None) -> pd.DataFrame:
     conn = db()
     if norm:
-        df = pd.read_sql_query("""
-            SELECT * FROM audit_questions
-            WHERE norm=?
-            ORDER BY chapter, clause, id
-        """, conn, params=(norm,))
+        df = pd.read_sql_query("SELECT * FROM audit_questions WHERE norm=? ORDER BY chapter, clause, id", conn, params=(norm,))
     else:
-        df = pd.read_sql_query("""
-            SELECT * FROM audit_questions
-            ORDER BY norm, chapter, clause, id
-        """, conn)
+        df = pd.read_sql_query("SELECT * FROM audit_questions ORDER BY norm, chapter, clause, id", conn)
     conn.close()
     return df
 
+def update_question_active(qid: int, is_active: bool):
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("UPDATE audit_questions SET is_active=? WHERE id=?", (1 if is_active else 0, qid))
+    conn.commit()
+    conn.close()
+
+def add_question(norm: str, chapter: str, clause: str, question: str, evidence_hint: str):
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO audit_questions(norm,chapter,clause,question,evidence_hint,is_active)
+        VALUES (?,?,?,?,?,1)
+    """, (norm, chapter, clause, question, evidence_hint))
+    conn.commit()
+    conn.close()
+
 
 # ---------------------------
-# Auth UI
+# UI: Login/Header
 # ---------------------------
 def login_ui():
     st.subheader("Login")
@@ -1362,11 +1391,8 @@ def login_ui():
             st.error("Falsches Passwort.")
             return
         st.session_state["user"] = {
-            "id": u["id"],
-            "email": u["email"],
-            "name": u["name"],
-            "role": u["role"],
-            "hotel_code": u["hotel_code"]
+            "id": u["id"], "email": u["email"], "name": u["name"],
+            "role": u["role"], "hotel_code": u["hotel_code"]
         }
         st.session_state["login_email"] = email.strip().lower()
         st.success(f"Eingeloggt als {u['name']} ({u['role']})")
@@ -1396,9 +1422,11 @@ def page_dashboard(hotels_df: pd.DataFrame):
     labels = hotel_label_map(hotels_df)
     st.subheader("Dashboard")
 
-    warn_days = st.slider("Warnschwelle (Tage bis fällig)", min_value=7, max_value=90, value=30, step=1)
+    warn_days = st.slider("Warnschwelle Betreiberpflichten (Tage bis fällig)", 7, 90, 30, 1)
+    days_ahead_program = st.slider("Auditprogramm: Zeige fällige Audits in den nächsten (Tagen)", 7, 120, 30, 1)
     hotel_filter = select_hotel_filter(hotels_df)
 
+    st.markdown("### KPI Betreiberpflichten")
     statuses, total = compliance_kpis(hotel_filter, warn_days=warn_days)
     c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("Überfällig", statuses["Überfällig"])
@@ -1407,27 +1435,45 @@ def page_dashboard(hotels_df: pd.DataFrame):
     c4.metric("OK", statuses["OK"])
     c5.metric("Gesamt", total)
 
-    actions = list_actions(hotel_filter)
-    open_actions = actions[actions["status"] != "Erledigt"] if len(actions) else actions
-    overdue = 0
+    st.divider()
+    st.markdown("### KPI Maßnahmen")
+    acts = list_actions(hotel_filter)
     td = today()
-    if len(open_actions):
-        for dd in open_actions["due_date"].tolist():
+    open_acts = acts[acts["status"] != "Erledigt"] if len(acts) else acts
+    overdue = 0
+    if len(open_acts):
+        for dd in open_acts["due_date"].tolist():
             d = parse_date(dd)
             if d and d < td:
                 overdue += 1
-    a1, a2, a3 = st.columns(3)
-    a1.metric("Offene Maßnahmen", len(open_actions))
-    a2.metric("Major offen", int((open_actions["category"] == "Major").sum()) if len(open_actions) else 0)
-    a3.metric("Maßnahmen überfällig", overdue)
+    a1, a2, a3, a4 = st.columns(4)
+    a1.metric("Offen", int((acts["status"]=="Offen").sum()) if len(acts) else 0)
+    a2.metric("In Bearbeitung", int((acts["status"]=="In Bearbeitung").sum()) if len(acts) else 0)
+    a3.metric("Wirksamkeit offen", int((acts["status"]=="Wirksamkeit offen").sum()) if len(acts) else 0)
+    a4.metric("Überfällig", overdue)
+
+    st.divider()
+    st.markdown("### Auditprogramm (geplante Audits)")
+    prog = program_digest(hotel_filter, days_ahead_program)
+    if prog["count"] == 0:
+        st.info("Keine fälligen geplanten Audits im Zeitraum.")
+    else:
+        view = pd.DataFrame([{
+            "Hotel": labels.get(it["hotel"], it["hotel"]),
+            "Norm": it["norm"],
+            "Bereich": it["area"],
+            "Geplant": fmt_date(it["planned"]),
+            "Tage": it["days"],
+            "Owner": it["owner"]
+        } for it in prog["items"][:50]])
+        st.dataframe(view, use_container_width=True, hide_index=True)
 
     st.divider()
     st.markdown("### Notifications (Outlook / Teams)")
     with st.expander("Digest senden", expanded=False):
         send_mail = st.checkbox("Outlook E-Mail senden (Graph)", value=bool(MS_TENANT_ID and MAIL_SENDER_UPN))
         send_teams = st.checkbox("Teams Nachricht senden (Webhook)", value=bool(TEAMS_WEBHOOK_URL))
-        default_to = st.session_state.get("digest_to", "")
-        to_emails = st.text_input("Empfänger (Komma-separiert)", value=default_to)
+        to_emails = st.text_input("Empfänger (Komma-separiert)", value=st.session_state.get("digest_to", ""))
         if st.button("Digest jetzt senden"):
             recipients = [e.strip() for e in to_emails.split(",") if e.strip()]
             st.session_state["digest_to"] = to_emails
@@ -1436,8 +1482,89 @@ def page_dashboard(hotels_df: pd.DataFrame):
             elif send_mail and not recipients:
                 st.error("Bitte E-Mail Empfänger eintragen.")
             else:
-                res = send_digest(recipients, hotel_filter, warn_days, send_mail, send_teams, hotels_df)
+                res = send_digest(recipients, hotel_filter, warn_days, days_ahead_program, send_mail, send_teams, hotels_df)
                 st.success(f"Ergebnis: Mail={res['mail']} · Teams={res['teams']}")
+
+def page_auditprogramm(hotels_df: pd.DataFrame):
+    require_login()
+    labels = hotel_label_map(hotels_df)
+    st.subheader("Auditprogramm / Jahresplan")
+
+    hotel_filter = select_hotel_filter(hotels_df)
+    df = list_program(hotel_filter)
+
+    if len(df):
+        show = df.copy()
+        show["Hotel"] = show["hotel_code"].apply(lambda x: labels.get(x, x))
+        show["Geplant"] = show["planned_date"].apply(lambda x: fmt_date(parse_date(x)))
+        show = show[["id","Hotel","norm","area","Geplant","status","reminder_days","owner_name","notes"]]
+        st.dataframe(show, use_container_width=True, hide_index=True)
+        st.download_button("CSV export", show.to_csv(index=False).encode("utf-8"), "auditprogramm.csv", "text/csv")
+    else:
+        st.info("Noch keine Einträge im Auditprogramm.")
+
+    st.divider()
+    st.markdown("### Eintrag anlegen / bearbeiten")
+    ids = df["id"].tolist() if len(df) else []
+    sel = st.selectbox("Auswählen", options=["Neu"] + ids, index=0)
+
+    if sel == "Neu":
+        with st.form("prog_new"):
+            if role_in("Direktor","Techniker"):
+                hc_opts = [st.session_state["user"]["hotel_code"]]
+            else:
+                hc_opts = hotels_df["code"].tolist()
+            hc = st.selectbox("Hotel", hc_opts, format_func=lambda x: labels.get(x, x))
+            norm = st.selectbox("Norm", ["ISO 9001","ISO 14001","ISO 45001","ISO 50001"])
+            area = st.text_input("Bereich/Prozess", "Technik")
+            planned = st.date_input("Geplantes Datum", value=today() + timedelta(days=30))
+            owner = st.text_input("Owner (z.B. Direktor/Technik)", "")
+            status = st.selectbox("Status", PROGRAM_STATUSES, index=0)
+            reminder_days = st.number_input("Reminder (Tage vorher)", 1, 90, 14, 1)
+            notes = st.text_area("Notizen", "", height=90)
+            ok = st.form_submit_button("Anlegen")
+        if ok:
+            if not can_access_hotel(hc):
+                st.error("Keine Berechtigung.")
+            else:
+                upsert_program_row(None, hc, norm, area.strip(), planned.isoformat(), owner.strip(), status, reminder_days, notes)
+                st.success("Angelegt.")
+                st.rerun()
+    else:
+        row = df[df["id"] == sel].iloc[0].to_dict()
+        if not can_access_hotel(row["hotel_code"]):
+            st.error("Keine Berechtigung.")
+            return
+
+        with st.form("prog_edit"):
+            st.write(f"**Hotel:** {labels.get(row['hotel_code'], row['hotel_code'])}")
+            norm = st.selectbox("Norm", ["ISO 9001","ISO 14001","ISO 45001","ISO 50001"],
+                                index=["ISO 9001","ISO 14001","ISO 45001","ISO 50001"].index(row["norm"]))
+            area = st.text_input("Bereich/Prozess", row["area"])
+            planned = st.date_input("Geplantes Datum", value=parse_date(row["planned_date"]) or today())
+            owner = st.text_input("Owner", row["owner_name"] or "")
+            status = st.selectbox("Status", PROGRAM_STATUSES, index=PROGRAM_STATUSES.index(row["status"]))
+            reminder_days = st.number_input("Reminder (Tage vorher)", 1, 90, int(row["reminder_days"] or 14), 1)
+            notes = st.text_area("Notizen", row["notes"] or "", height=90)
+            c1, c2 = st.columns(2)
+            save = c1.form_submit_button("Speichern")
+            delete = c2.form_submit_button("Löschen")
+        if save:
+            upsert_program_row(int(sel), row["hotel_code"], norm, area.strip(), planned.isoformat(), owner.strip(), status, reminder_days, notes)
+            st.success("Gespeichert.")
+            st.rerun()
+        if delete:
+            if not role_in("Admin"):
+                st.error("Löschen nur Admin.")
+            else:
+                delete_program_row(int(sel))
+                st.success("Gelöscht.")
+                st.rerun()
+
+        st.divider()
+        st.markdown("### Anhänge (Auditprogramm)")
+        upload_attachment_ui(row["hotel_code"], "program", int(sel))
+        attachments_list_ui(row["hotel_code"], "program", int(sel))
 
 def page_betreiberpflichten(hotels_df: pd.DataFrame):
     require_login()
@@ -1473,361 +1600,473 @@ def page_betreiberpflichten(hotels_df: pd.DataFrame):
         view["days_sort"] = pd.to_numeric(view["Tage"], errors="coerce").fillna(999999)
         view = view.sort_values(["sev", "days_sort", "Hotel", "Anlage"]).drop(columns=["sev","days_sort"])
     st.dataframe(view, use_container_width=True, hide_index=True)
-    st.download_button("CSV export", view.to_csv(index=False).encode("utf-8"), "betreiberpflichten.csv", "text/csv")
 
     st.divider()
-    st.markdown("### Eintrag bearbeiten / neu anlegen")
-    ids = df["id"].tolist()
-    sel_id = st.selectbox("Eintrag wählen", options=["Neu"] + ids, index=0)
-
-    if sel_id == "Neu":
-        with st.form("add_compliance"):
-            if role_in("Direktor","Techniker"):
-                hc_opts = [st.session_state["user"]["hotel_code"]]
-            else:
-                hc_opts = hotels_df["code"].tolist()
-            hc = st.selectbox("Hotel", hc_opts, format_func=lambda x: labels.get(x, x))
-            asset = st.text_input("Anlage", "")
-            task = st.text_input("Prüfung/Wartung", "")
-            interval = st.number_input("Intervall (Monate)", min_value=1, max_value=120, value=12, step=1)
-            ok = st.form_submit_button("Anlegen")
-        if ok:
-            if not can_access_hotel(hc):
-                st.error("Keine Berechtigung.")
-            elif not asset.strip() or not task.strip():
-                st.error("Bitte Anlage und Aufgabe ausfüllen.")
-            else:
-                add_compliance_item(hc, asset.strip(), task.strip(), int(interval))
-                st.success("Angelegt.")
-                st.rerun()
-    else:
-        r = df[df["id"] == sel_id].iloc[0].to_dict()
-        if not can_access_hotel(r["hotel_code"]):
+    st.markdown("### Eintrag bearbeiten")
+    ids = df["id"].tolist() if len(df) else []
+    sel = st.selectbox("Betreiberpflicht auswählen", options=["—"] + ids, index=0)
+    if sel != "—":
+        row = df[df["id"] == sel].iloc[0].to_dict()
+        if not can_access_hotel(row["hotel_code"]):
             st.error("Keine Berechtigung.")
             return
-        with st.form("edit_compliance"):
-            st.write(f"**Hotel:** {labels.get(r['hotel_code'], r['hotel_code'])} · **Anlage:** {r['asset']} · **Aufgabe:** {r['task']}")
-            interval = st.number_input("Intervall (Monate)", 1, 120, int(r["interval_months"]), 1)
-            last = parse_date(r["last_date"])
-            last_new = st.date_input("Letzte Prüfung", value=last or today())
-            owner = st.text_input("Verantwortlich", value=r["owner_name"] or "")
-            link = st.text_input("Nachweis/Link/Ticket", value=r["evidence_link"] or "")
-            notes = st.text_area("Bemerkung", value=r["notes"] or "", height=120)
-            c1, c2 = st.columns([1,1])
+        with st.form("ops_edit"):
+            st.write(f"**Hotel:** {labels.get(row['hotel_code'], row['hotel_code'])}")
+            st.write(f"**Anlage:** {row['asset']} · **Aufgabe:** {row['task']}")
+            interval = st.number_input("Intervall (Monate)", 1, 120, int(row["interval_months"]), 1)
+            last = st.date_input("Letzte Prüfung", value=parse_date(row["last_date"]) or today())
+            owner = st.text_input("Owner", row.get("owner_name") or "")
+            link = st.text_input("Link / Nachweis", row.get("evidence_link") or "")
+            notes = st.text_area("Notizen", row.get("notes") or "", height=90)
+            c1, c2 = st.columns(2)
             save = c1.form_submit_button("Speichern")
             delete = c2.form_submit_button("Löschen")
         if save:
-            update_compliance_item(int(sel_id), int(interval), last_new.isoformat(), owner, link, notes)
+            update_compliance_item(int(sel), int(interval), last.isoformat(), owner, link, notes)
             st.success("Gespeichert.")
             st.rerun()
         if delete:
             if not role_in("Admin"):
                 st.error("Löschen nur Admin.")
             else:
-                delete_compliance_item(int(sel_id))
+                delete_compliance_item(int(sel))
                 st.success("Gelöscht.")
                 st.rerun()
 
         st.divider()
-        st.markdown("### Anhänge (Prüfprotokolle, Fotos, etc.)")
-        upload_attachment_ui(r["hotel_code"], "compliance", int(sel_id))
-        attachments_list_ui(r["hotel_code"], "compliance", int(sel_id))
+        st.markdown("### Anhänge (Betreiberpflichten)")
+        upload_attachment_ui(row["hotel_code"], "compliance", int(sel))
+        attachments_list_ui(row["hotel_code"], "compliance", int(sel))
+
+    st.divider()
+    st.markdown("### Neue Betreiberpflicht anlegen")
+    with st.form("ops_new"):
+        if role_in("Direktor","Techniker"):
+            hc_opts = [st.session_state["user"]["hotel_code"]]
+        else:
+            hc_opts = hotels_df["code"].tolist()
+        hc = st.selectbox("Hotel", hc_opts, format_func=lambda x: labels.get(x, x))
+        asset = st.text_input("Anlage", "")
+        task = st.text_input("Aufgabe", "")
+        interval = st.number_input("Intervall (Monate)", 1, 120, 12, 1)
+        ok = st.form_submit_button("Anlegen")
+    if ok:
+        if not can_access_hotel(hc):
+            st.error("Keine Berechtigung.")
+        elif not asset.strip() or not task.strip():
+            st.error("Bitte Anlage und Aufgabe ausfüllen.")
+        else:
+            add_compliance_item(hc, asset.strip(), task.strip(), int(interval))
+            st.success("Angelegt.")
+            st.rerun()
 
 def page_audits(hotels_df: pd.DataFrame):
     require_login()
     labels = hotel_label_map(hotels_df)
-    code_to_name = {r["code"]: r["name"] for _, r in hotels_df.iterrows()}
-    st.subheader("Audits")
+    st.subheader("Audits (inkl. Auditbogen)")
 
     hotel_filter = select_hotel_filter(hotels_df)
+    df = list_audits(hotel_filter)
 
-    st.markdown("### Auditliste")
-    dfa = list_audits(hotel_filter)
-    if len(dfa):
-        show = dfa.copy()
+    if len(df):
+        show = df.copy()
         show["Hotel"] = show["hotel_code"].apply(lambda x: labels.get(x, x))
         show["Auditdatum"] = show["audit_date"].apply(lambda x: fmt_date(parse_date(x)))
-        show = show[["id","audit_code","Hotel","norm","area","Auditdatum","status","score","auditor_name"]]
+        show = show[["id","audit_code","Hotel","norm","area","auditor_name","Auditdatum","status","score"]]
         st.dataframe(show, use_container_width=True, hide_index=True)
     else:
         st.info("Noch keine Audits vorhanden.")
 
     st.divider()
     st.markdown("### Audit anlegen")
-    with st.form("create_audit"):
+    with st.form("audit_new"):
         if role_in("Direktor","Techniker"):
             hc_opts = [st.session_state["user"]["hotel_code"]]
         else:
             hc_opts = hotels_df["code"].tolist()
-        hc = st.selectbox("Hotel", hc_opts, format_func=lambda x: labels.get(x, x))
-        norm = st.selectbox("Norm", ["ISO 9001","ISO 14001","ISO 45001","ISO 50001"])
-        area = st.text_input("Bereich/Prozess", "Technik")
-        auditor = st.text_input("Auditor", st.session_state["user"]["name"])
-        adate = st.date_input("Auditdatum", value=today())
-        status = st.selectbox("Status", ["Geplant","In Durchführung","Abgeschlossen"])
+        hc = st.selectbox("Hotel", hc_opts, format_func=lambda x: labels.get(x, x), key="audit_new_h")
+        norm = st.selectbox("Norm", ["ISO 50001","ISO 14001","ISO 45001","ISO 9001"], key="audit_new_n")
+        area = st.text_input("Bereich/Prozess", "Technik", key="audit_new_a")
+        auditor = st.text_input("Auditor", st.session_state["user"]["name"], key="audit_new_u")
+        adate = st.date_input("Auditdatum", value=today(), key="audit_new_d")
+        status = st.selectbox("Status", ["Geplant","Durchgeführt","Abgeschlossen"], index=1, key="audit_new_s")
         ok = st.form_submit_button("Audit anlegen")
     if ok:
         if not can_access_hotel(hc):
             st.error("Keine Berechtigung.")
         else:
-            acode = create_audit(hc, norm, area, auditor, adate.isoformat(), status)
-            st.success(f"Audit erstellt: {acode}")
+            code = create_audit(hc, norm, area.strip(), auditor.strip(), adate.isoformat(), status)
+            st.success(f"Audit angelegt: {code}")
             st.rerun()
 
     st.divider()
-    st.markdown("### Audit durchführen / bearbeiten")
-    if len(dfa):
-        audit_ids = dfa["id"].tolist()
-        sel_audit_id = st.selectbox(
-            "Audit auswählen",
-            options=audit_ids,
-            format_func=lambda i: f"{int(i)} – {dfa[dfa['id']==i].iloc[0]['audit_code']} ({labels.get(dfa[dfa['id']==i].iloc[0]['hotel_code'], '')})"
-        )
-        audit = get_audit(int(sel_audit_id))
-        if not can_access_hotel(audit["hotel_code"]):
-            st.error("Keine Berechtigung.")
-            return
+    st.markdown("### Audit bearbeiten / Auditbogen")
+    ids = df["id"].tolist() if len(df) else []
+    sel = st.selectbox("Audit auswählen", options=["—"] + ids, index=0, format_func=lambda x: "—" if x=="—" else f"ID {x}")
+    if sel == "—":
+        return
 
-        ensure_audit_answers(audit["id"], audit["norm"])
-        dfq = audit_questions_answers(audit["id"])
+    audit = get_audit_by_id(int(sel))
+    if not can_access_hotel(audit["hotel_code"]):
+        st.error("Keine Berechtigung.")
+        return
 
-        with st.expander("Audit-Metadaten", expanded=True):
-            c1, c2, c3 = st.columns(3)
-            with c1:
-                st.write(f"**Audit:** {audit['audit_code']}")
-                st.write(f"**Hotel:** {labels.get(audit['hotel_code'], audit['hotel_code'])}")
-                st.write(f"**Norm:** {audit['norm']}")
-                st.write(f"**Bereich:** {audit['area']}")
-            with c2:
-                status = st.selectbox("Status", ["Geplant","In Durchführung","Abgeschlossen"],
-                                      index=["Geplant","In Durchführung","Abgeschlossen"].index(audit["status"]))
-                ad = parse_date(audit["audit_date"]) or today()
-                ad_new = st.date_input("Auditdatum", value=ad, key=f"ad_{audit['id']}")
-            with c3:
-                auditor_name = st.text_input("Auditor", value=audit.get("auditor_name") or "")
-                st.metric("Score", "—" if audit.get("score") is None else audit.get("score"))
-
+    # Meta
+    with st.expander("Audit Stammdaten", expanded=True):
+        with st.form("audit_meta"):
+            st.write(f"**Audit Code:** {audit['audit_code']}")
+            st.write(f"**Hotel:** {labels.get(audit['hotel_code'], audit['hotel_code'])}")
+            status = st.selectbox("Status", ["Geplant","Durchgeführt","Abgeschlossen"],
+                                  index=["Geplant","Durchgeführt","Abgeschlossen"].index(audit["status"]))
+            adate = st.date_input("Auditdatum", value=parse_date(audit["audit_date"]) or today())
+            auditor = st.text_input("Auditor", value=audit.get("auditor_name") or "")
             summary = st.text_area("Zusammenfassung", value=audit.get("summary") or "", height=120)
+            c1, c2, c3 = st.columns([1,1,1])
+            save = c1.form_submit_button("Speichern")
+            del_btn = c2.form_submit_button("Audit löschen")
+            score_btn = c3.form_submit_button("Score neu berechnen")
+        if save:
+            update_audit_meta(int(sel), status, adate.isoformat(), auditor.strip(), summary)
+            st.success("Gespeichert.")
+            st.rerun()
+        if del_btn:
+            if not role_in("Admin"):
+                st.error("Löschen nur Admin.")
+            else:
+                delete_audit(int(sel))
+                st.success("Audit gelöscht.")
+                st.rerun()
+        if score_btn:
+            sc = recompute_audit_score(int(sel))
+            st.success(f"Score aktualisiert: {sc if sc is not None else '—'}")
+            st.rerun()
 
-            colx, coly, colz = st.columns([1,1,1])
-            if colx.button("Metadaten speichern"):
-                update_audit_meta(audit["id"], status, ad_new.isoformat(), auditor_name, summary)
+    # PDF + Anhänge
+    with st.expander("Audit PDF / Anhänge", expanded=False):
+        dfq = audit_questions_answers(int(sel))
+        hotels = hotels_df.set_index("code")
+        hotel_name = hotels.loc[audit["hotel_code"], "name"] if audit["hotel_code"] in hotels.index else audit["hotel_code"]
+        pdf_bytes = make_audit_pdf(audit, dfq, str(hotel_name))
+        st.download_button("Auditbericht als PDF", pdf_bytes, file_name=f"{audit['audit_code']}.pdf", mime="application/pdf")
+
+        st.markdown("#### Anhänge (Audit)")
+        upload_attachment_ui(audit["hotel_code"], "audit", int(sel))
+        attachments_list_ui(audit["hotel_code"], "audit", int(sel))
+
+    # Auditbogen
+    st.markdown("### Auditbogen (TÜV-Style)")
+    dfq = audit_questions_answers(int(sel))
+
+    # Filter
+    chapters = sorted(dfq["chapter"].dropna().unique().tolist())
+    ch_filter = st.multiselect("Kapitel filtern", chapters, default=chapters)
+    if ch_filter:
+        dfq_view = dfq[dfq["chapter"].isin(ch_filter)].copy()
+    else:
+        dfq_view = dfq.copy()
+
+    st.caption("Bewertung: 0=Nicht erfüllt, 1=Teilweise, 2=Erfüllt. Abweichung Ja/Nein + Typ (OFI/Minor/Major).")
+
+    # Editor je Frage
+    for _, row in dfq_view.iterrows():
+        with st.container(border=True):
+            left, right = st.columns([3,2])
+
+            clause = row.get("clause") or row.get("chapter") or ""
+            left.markdown(f"**{row['norm']} · {clause}**")
+            left.write(row["question"])
+            if row.get("evidence_hint"):
+                left.caption(f"Prüfhinweise/Nachweise: {row['evidence_hint']}")
+
+            # Input controls
+            score = right.selectbox("Bewertung", ["", "0", "1", "2"], index=["", "0", "1", "2"].index(row["score"] or ""), key=f"sc_{row['answer_id']}")
+            deviation = right.selectbox("Abweichung?", ["", "Nein", "Ja"], index=["", "Nein", "Ja"].index(row["deviation"] or ""), key=f"dev_{row['answer_id']}")
+            dtype = right.selectbox("Typ", ["", "OFI", "Minor", "Major"],
+                                    index=["", "OFI", "Minor", "Major"].index(row["deviation_type"] or ""),
+                                    key=f"dt_{row['answer_id']}")
+
+            evidence = st.text_area("Objektiver Nachweis (was gesehen/geprüft, Dokument, Messwert, Stichprobe)", value=row["evidence"] or "", height=70, key=f"ev_{row['answer_id']}")
+            notes = st.text_area("Notizen / Kontext / Abgrenzung", value=row["notes"] or "", height=70, key=f"no_{row['answer_id']}")
+
+            c1, c2 = st.columns([1,3])
+            if c1.button("Speichern", key=f"save_{row['answer_id']}"):
+                update_audit_answer(int(row["answer_id"]), score, deviation, dtype, evidence.strip(), notes.strip())
+                recompute_audit_score(int(sel))
                 st.success("Gespeichert.")
                 st.rerun()
 
-            if coly.button("Score neu berechnen"):
-                s = recompute_audit_score(audit["id"])
-                st.success(f"Neuer Score: {s}")
-                st.rerun()
-
-            if colz.button("Auditbericht als PDF"):
-                recompute_audit_score(audit["id"])
-                audit = get_audit(int(sel_audit_id))
-                dfq = audit_questions_answers(audit["id"])
-                pdf_bytes = make_audit_pdf(audit, dfq, code_to_name.get(audit["hotel_code"], ""))
-                st.download_button(
-                    "PDF herunterladen",
-                    pdf_bytes,
-                    file_name=f"{audit['audit_code']}_Auditbericht.pdf",
-                    mime="application/pdf"
-                )
-
-        st.markdown("#### Checkliste (mit Abweichungstyp)")
-        st.caption("Bewertung: 0=nicht erfüllt, 1=teilweise erfüllt, 2=erfüllt, NA=nicht anwendbar")
-
-        for _, row in dfq.iterrows():
-            clause = row.get("clause") or row.get("chapter") or ""
-            with st.container(border=True):
-                st.write(f"**{clause}** · {row['question']}")
-                hint = (row.get("evidence_hint") or "").strip()
-                if hint:
-                    st.caption(f"Prüfhinweis/Nachweise/Stichprobe: {hint}")
-
-                c1, c2, c3, c4, c5 = st.columns([1,1,1,2,2])
-                with c1:
-                    score = st.selectbox(
-                        "Bewertung",
-                        ["","0","1","2","NA"],
-                        index=["","0","1","2","NA"].index(row["score"] if row["score"] in ("0","1","2","NA") else ""),
-                        key=f"sc_{row['answer_id']}"
+            # Quick action create for deviations
+            if deviation == "Ja" and dtype in ("OFI","Minor","Major"):
+                if st.button(f"➡️ Maßnahme aus {dtype} erzeugen", key=f"mkact_{row['answer_id']}"):
+                    cat = "Verbesserung" if dtype == "OFI" else ("Minor" if dtype=="Minor" else "Major")
+                    title = f"{audit['audit_code']} – {audit['norm']} {clause}: {row['question'][:80]}..."
+                    create_action(
+                        hotel_code=audit["hotel_code"],
+                        audit_id=int(sel),
+                        title=title,
+                        category=cat,
+                        owner_name="",
+                        due_date_str=(today() + timedelta(days=14)).isoformat(),
+                        status="Offen",
+                        notes=f"Abweichungstyp: {dtype}\n\nNachweis:\n{evidence.strip()}\n\nNotizen:\n{notes.strip()}",
+                        risk_level=("Hoch" if dtype=="Major" else ""),
+                        immediate_action="",
+                        root_cause="",
+                        corrective_action=""
                     )
-                with c2:
-                    dev = st.selectbox(
-                        "Abweichung",
-                        ["","Nein","Ja"],
-                        index=["","Nein","Ja"].index(row["deviation"] if row["deviation"] in ("Ja","Nein") else ""),
-                        key=f"dv_{row['answer_id']}"
-                    )
-                with c3:
-                    # Nur wenn Abweichung = Ja: OFI/Minor/Major
-                    current_type = row.get("deviation_type") or ""
-                    dtype_options = ["","OFI","Minor","Major"]
-                    if dev != "Ja":
-                        dtype = ""
-                        st.selectbox("Typ", dtype_options, index=0, key=f"dt_{row['answer_id']}", disabled=True)
-                    else:
-                        dtype = st.selectbox("Typ", dtype_options,
-                                             index=dtype_options.index(current_type) if current_type in dtype_options else 0,
-                                             key=f"dt_{row['answer_id']}")
-                with c4:
-                    evidence = st.text_input("Nachweis (Link/Ticket/Dokument)", value=row["evidence"] or "", key=f"ev_{row['answer_id']}")
-                with c5:
-                    notes = st.text_input("Bemerkung", value=row["notes"] or "", key=f"nt_{row['answer_id']}")
-
-                if st.button("Speichern", key=f"save_{row['answer_id']}"):
-                    # Wenn dev=Ja aber kein Typ gewählt → default Minor
-                    use_type = dtype
-                    if dev == "Ja" and not use_type:
-                        use_type = "Minor"
-                    update_audit_answer(int(row["answer_id"]), score, dev, use_type, evidence, notes)
-                    recompute_audit_score(audit["id"])
-                    st.success("Gespeichert.")
+                    st.success("Maßnahme erzeugt.")
                     st.rerun()
 
-        st.divider()
-        st.markdown("### Maßnahmen aus Abweichungen generieren (OFI/Minor/Major)")
-        if st.button("Abweichungen (Ja) → Maßnahmen erstellen"):
-            devs = dfq[dfq["deviation"] == "Ja"]
-            created = 0
-            for _, r in devs.iterrows():
-                clause = r.get("clause") or r.get("chapter") or ""
-                dtype = (r.get("deviation_type") or "Minor").strip() or "Minor"
-                # OFI wird als "Verbesserung" geführt, Minor/Major entsprechend
-                if dtype == "OFI":
-                    cat = "Verbesserung"
-                elif dtype == "Major":
-                    cat = "Major"
-                else:
-                    cat = "Minor"
-
-                title = f"[{audit['audit_code']}] {dtype} {clause}: {r['question'][:120]}"
-                create_action(audit["hotel_code"], audit["id"], title, cat, "", None, "Offen", "Auto erzeugt aus Audit-Abweichung")
-                created += 1
-
-            st.success(f"{created} Maßnahmen erstellt.")
-            st.rerun()
-
-        st.divider()
-        st.markdown("### Anhänge (Audit-Unterlagen)")
-        upload_attachment_ui(audit["hotel_code"], "audit", int(audit["id"]))
-        attachments_list_ui(audit["hotel_code"], "audit", int(audit["id"]))
-    else:
-        st.info("Lege zuerst ein Audit an.")
-
-def page_massnahmen(hotels_df: pd.DataFrame):
+def page_actions(hotels_df: pd.DataFrame):
     require_login()
     labels = hotel_label_map(hotels_df)
-    st.subheader("Maßnahmen / Findings")
+    st.subheader("Maßnahmen (CAPA / Abweichungen / Verbesserungen)")
 
     hotel_filter = select_hotel_filter(hotels_df)
     df = list_actions(hotel_filter)
 
-    td = today()
-    overdue = 0
-    if len(df):
-        open_df = df[df["status"] != "Erledigt"]
-        for dd in open_df["due_date"].tolist():
-            d = parse_date(dd)
-            if d and d < td:
-                overdue += 1
-
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Offen", int((df["status"]=="Offen").sum()) if len(df) else 0)
-    c2.metric("In Bearbeitung", int((df["status"]=="In Bearbeitung").sum()) if len(df) else 0)
-    c3.metric("Erledigt", int((df["status"]=="Erledigt").sum()) if len(df) else 0)
-    c4.metric("Überfällig", overdue)
-
-    st.divider()
-    st.markdown("### Liste")
+    # Liste
     if len(df):
         show = df.copy()
         show["Hotel"] = show["hotel_code"].apply(lambda x: labels.get(x, x))
         show["Frist"] = show["due_date"].apply(lambda x: fmt_date(parse_date(x)))
         show["Wirksamkeit"] = show["effectiveness_date"].apply(lambda x: fmt_date(parse_date(x)))
-        show = show[["id","Hotel","audit_code","category","title","owner_name","Frist","status","Wirksamkeit","notes"]]
+        show = show[["id","Hotel","audit_code","category","title","status","Frist","owner_name","risk_level","Wirksamkeit"]]
         st.dataframe(show, use_container_width=True, hide_index=True)
         st.download_button("CSV export", show.to_csv(index=False).encode("utf-8"), "massnahmen.csv", "text/csv")
     else:
-        st.info("Noch keine Einträge.")
+        st.info("Noch keine Maßnahmen.")
+
+    st.divider()
+    st.markdown("### Maßnahme anlegen")
+    with st.form("act_new"):
+        if role_in("Direktor","Techniker"):
+            hc_opts = [st.session_state["user"]["hotel_code"]]
+        else:
+            hc_opts = hotels_df["code"].tolist()
+        hc = st.selectbox("Hotel", hc_opts, format_func=lambda x: labels.get(x, x))
+        title = st.text_input("Titel", "")
+        category = st.selectbox("Kategorie", ACTION_CATEGORIES, index=3)
+        owner = st.text_input("Owner", "")
+        due = st.date_input("Frist", value=today() + timedelta(days=14))
+        status = st.selectbox("Status", ACTION_STATUSES, index=0)
+        notes = st.text_area("Notizen", "", height=90)
+
+        # Major-Felder (optional bei Anlage, Pflicht wird beim Speichern geprüft)
+        risk = st.selectbox("Risiko-Level (wichtig bei Major)", RISK_LEVELS, index=0)
+        immediate = st.text_area("Sofortmaßnahme (bei Major Pflicht)", "", height=70)
+        root = st.text_area("Ursachenanalyse (bei Major Pflicht)", "", height=70)
+        corr = st.text_area("Korrekturmaßnahme (bei Major Pflicht)", "", height=70)
+
+        ok = st.form_submit_button("Anlegen")
+    if ok:
+        if not can_access_hotel(hc):
+            st.error("Keine Berechtigung.")
+        elif not title.strip():
+            st.error("Bitte Titel ausfüllen.")
+        else:
+            # Major minimal check (bei Anlage bereits streng)
+            if category == "Major":
+                missing = []
+                if not risk:
+                    missing.append("Risiko-Level")
+                if not immediate.strip():
+                    missing.append("Sofortmaßnahme")
+                if not root.strip():
+                    missing.append("Ursachenanalyse")
+                if not corr.strip():
+                    missing.append("Korrekturmaßnahme")
+                if missing:
+                    st.error("Bei Major bitte ausfüllen: " + ", ".join(missing))
+                    return
+
+            create_action(hc, None, title.strip(), category, owner.strip(), due.isoformat(), status,
+                          notes=notes, risk_level=risk, immediate_action=immediate, root_cause=root, corrective_action=corr)
+            st.success("Maßnahme angelegt.")
+            st.rerun()
+
+    st.divider()
+    st.markdown("### Maßnahme bearbeiten")
+    ids = df["id"].tolist() if len(df) else []
+    sel = st.selectbox("Maßnahme auswählen", options=["—"] + ids, index=0)
+    if sel == "—":
+        return
+    row = df[df["id"] == sel].iloc[0].to_dict()
+    if not can_access_hotel(row["hotel_code"]):
+        st.error("Keine Berechtigung.")
+        return
+
+    with st.form("act_edit"):
+        st.write(f"**Hotel:** {labels.get(row['hotel_code'], row['hotel_code'])}")
+        st.write(f"**Audit:** {row.get('audit_code') or '—'}")
+        title = st.text_input("Titel", row["title"])
+        category = st.selectbox("Kategorie", ACTION_CATEGORIES, index=ACTION_CATEGORIES.index(row["category"]))
+        owner = st.text_input("Owner", row.get("owner_name") or "")
+        due = st.date_input("Frist", value=parse_date(row["due_date"]) or today())
+        status = st.selectbox("Status", ACTION_STATUSES, index=ACTION_STATUSES.index(row["status"]))
+        notes = st.text_area("Notizen", row.get("notes") or "", height=90)
+
+        risk = st.selectbox("Risiko-Level", RISK_LEVELS, index=RISK_LEVELS.index(row.get("risk_level") or ""))
+        immediate = st.text_area("Sofortmaßnahme", row.get("immediate_action") or "", height=70)
+        root = st.text_area("Ursachenanalyse", row.get("root_cause") or "", height=70)
+        corr = st.text_area("Korrekturmaßnahme", row.get("corrective_action") or "", height=70)
+
+        eff_date = st.date_input("Wirksamkeitsdatum (Pflicht bei Erledigt)", value=parse_date(row["effectiveness_date"]) or today())
+        eff_res = st.text_area("Wirksamkeitsergebnis (Pflicht bei Erledigt)", row.get("effectiveness_result") or "", height=70)
+
+        c1, c2 = st.columns(2)
+        save = c1.form_submit_button("Speichern")
+        delete = c2.form_submit_button("Löschen")
+
+    if save:
+        # Major Pflichtfelder
+        if category == "Major":
+            missing = []
+            if not risk:
+                missing.append("Risiko-Level")
+            if not immediate.strip():
+                missing.append("Sofortmaßnahme")
+            if not root.strip():
+                missing.append("Ursachenanalyse")
+            if not corr.strip():
+                missing.append("Korrekturmaßnahme")
+            if due is None:
+                missing.append("Frist")
+            if missing:
+                st.error("Bei Major bitte ausfüllen: " + ", ".join(missing))
+                return
+
+        # Erledigt -> Wirksamkeit Pflicht
+        if status == "Erledigt":
+            if not eff_res.strip():
+                st.error("Bei Status 'Erledigt' bitte Wirksamkeitsergebnis ausfüllen.")
+                return
+            eff_date_str = eff_date.isoformat()
+            eff_res_str = eff_res.strip()
+        else:
+            eff_date_str = None
+            eff_res_str = None
+
+        update_action(
+            int(sel),
+            title.strip(),
+            category,
+            owner.strip(),
+            due.isoformat() if due else None,
+            status,
+            eff_date_str,
+            eff_res_str,
+            risk,
+            immediate.strip(),
+            root.strip(),
+            corr.strip(),
+            notes
+        )
+        st.success("Gespeichert.")
+        st.rerun()
+
+    if delete:
+        if not role_in("Admin"):
+            st.error("Löschen nur Admin.")
+        else:
+            delete_action(int(sel))
+            st.success("Gelöscht.")
+            st.rerun()
+
+    st.divider()
+    st.markdown("### Anhänge (Maßnahme)")
+    upload_attachment_ui(row["hotel_code"], "action", int(sel))
+    attachments_list_ui(row["hotel_code"], "action", int(sel))
+
+def page_question_catalog(hotels_df: pd.DataFrame):
+    require_login()
+    if not role_in("Admin"):
+        st.error("Nur Admin.")
+        return
+    st.subheader("Admin: Fragenkatalog (Auditbogen)")
+
+    norm = st.selectbox("Norm", ["ISO 50001","ISO 14001","ISO 45001","ISO 9001","(Alle)"])
+    df = list_audit_questions(None if norm=="(Alle)" else norm)
+
+    if len(df):
+        show = df.copy()
+        show["active"] = show["is_active"].apply(lambda x: "Ja" if int(x)==1 else "Nein")
+        show = show[["id","norm","chapter","clause","active","question"]]
+        st.dataframe(show, use_container_width=True, hide_index=True)
+    else:
+        st.info("Keine Fragen vorhanden.")
+
+    st.divider()
+    st.markdown("### Neue Frage hinzufügen")
+    with st.form("q_new"):
+        n = st.selectbox("Norm", ["ISO 50001","ISO 14001","ISO 45001","ISO 9001"])
+        chapter = st.text_input("Kapitel (z.B. 6)", "")
+        clause = st.text_input("Clause (z.B. 6.3)", "")
+        question = st.text_area("Frage", "", height=90)
+        hint = st.text_area("Prüfhinweise/Nachweise", "", height=90)
+        ok = st.form_submit_button("Hinzufügen")
+    if ok:
+        if not (chapter.strip() and question.strip()):
+            st.error("Bitte mindestens Kapitel und Frage ausfüllen.")
+        else:
+            add_question(n, chapter.strip(), clause.strip(), question.strip(), hint.strip())
+            st.success("Frage hinzugefügt.")
+            st.rerun()
+
+    st.divider()
+    st.markdown("### Frage aktiv/inaktiv schalten")
+    qids = df["id"].tolist() if len(df) else []
+    sel = st.selectbox("Frage auswählen", options=["—"] + qids, index=0)
+    if sel != "—":
+        row = df[df["id"] == sel].iloc[0].to_dict()
+        is_active = st.checkbox("Aktiv", value=bool(int(row["is_active"])))
+        if st.button("Speichern", key="q_act_save"):
+            update_question_active(int(sel), is_active)
+            st.success("Gespeichert.")
+            st.rerun()
 
 def page_admin(hotels_df: pd.DataFrame):
     require_login()
     if not role_in("Admin"):
         st.error("Nur Admin.")
         return
-
     labels = hotel_label_map(hotels_df)
-    st.subheader("Admin")
-    tab1, tab2, tab3, tab4 = st.tabs(["Hotels", "User", "Auditfragen", "Integrationen"])
+    st.subheader("Admin: Benutzerverwaltung")
+    st.markdown("Standard Admin: **admin@local / admin123** (bitte ändern)")
 
-    with tab1:
-        st.markdown("### Hotels")
-        st.dataframe(hotels_df, use_container_width=True, hide_index=True)
+    users = list_users()
+    users_show = users.copy()
+    users_show["Hotel"] = users_show["hotel_code"].apply(lambda x: labels.get(x, "") if x else "")
+    users_show = users_show.drop(columns=["hotel_code"])
+    st.dataframe(users_show, use_container_width=True, hide_index=True)
 
-    with tab2:
-        st.markdown("### User")
-        users = list_users()
-        users_show = users.copy()
-        users_show["Hotel"] = users_show["hotel_code"].apply(lambda x: labels.get(x, "") if x else "")
-        users_show = users_show.drop(columns=["hotel_code"])
-        st.dataframe(users_show, use_container_width=True, hide_index=True)
-
-        st.markdown("#### User anlegen/ändern")
-        hc_opts = ["—"] + hotels_df["code"].tolist()
-        with st.form("upsert_user_form"):
-            email = st.text_input("E-Mail", "")
-            name = st.text_input("Name", "")
-            role = st.selectbox("Rolle", ["Admin","Direktor","Techniker","Auditor"])
-            hotel_code = st.selectbox("Hotel (für Direktor/Techniker)", hc_opts,
-                                      format_func=lambda x: "—" if x == "—" else labels.get(x, x))
-            pw = st.text_input("Neues Passwort (leer = nicht ändern)", type="password")
-            active = st.checkbox("Aktiv", value=True)
-            ok = st.form_submit_button("Speichern")
-        if ok:
-            if not email.strip() or not name.strip():
-                st.error("E-Mail und Name sind Pflicht.")
-            else:
-                hc_val = None if hotel_code == "—" else hotel_code
-                upsert_user(email.strip().lower(), name.strip(), role, hc_val, pw if pw else None, active)
-                st.success("Gespeichert.")
-                st.rerun()
-
-        st.info("Default Admin: admin@local / admin123 (bitte sofort ändern).")
-
-    with tab3:
-        st.markdown("### Auditfragen-Katalog (Import/Update)")
-
-        colA, colB, colC = st.columns([1,1,1])
-        with colA:
-            norm_filter = st.selectbox("Norm filtern", ["Alle","ISO 9001","ISO 14001","ISO 45001","ISO 50001"], index=0)
-
-        with colB:
-            if st.button("ISO 50001 import/update"):
-                inserted = insert_questions_if_missing(build_questions_50001_detailed())
-                st.success(f"ISO 50001: Neu eingefügt: {inserted}")
-                st.rerun()
-        with colC:
-            if st.button("ISO 14001 + 45001 import/update"):
-                i1 = insert_questions_if_missing(build_questions_14001_detailed())
-                i2 = insert_questions_if_missing(build_questions_45001_detailed())
-                st.success(f"ISO 14001: {i1} neu · ISO 45001: {i2} neu")
-                st.rerun()
-
-        dfq = list_audit_questions(None if norm_filter == "Alle" else norm_filter)
-        show = dfq[["id","norm","chapter","clause","question","evidence_hint","is_active"]]
-        st.dataframe(show, use_container_width=True, hide_index=True)
-
-    with tab4:
-        st.markdown("### Integrationen (Outlook / Teams)")
-        st.write("**Teams Webhook aktiv:**", bool(TEAMS_WEBHOOK_URL))
-        st.write("**Microsoft Graph aktiv:**", bool(MS_TENANT_ID and MS_CLIENT_ID and MS_CLIENT_SECRET and MAIL_SENDER_UPN))
+    st.divider()
+    st.markdown("### User anlegen / ändern")
+    with st.form("user_upsert"):
+        email = st.text_input("E-Mail", "")
+        name = st.text_input("Name", "")
+        role = st.selectbox("Rolle", ["Admin","Auditor","Direktor","Techniker"])
+        hotel = st.selectbox("Hotel (nur für Direktor/Techniker)", [""] + hotels_df["code"].tolist(),
+                             format_func=lambda x: "" if x=="" else labels.get(x, x))
+        pw = st.text_input("Neues Passwort (leer = unverändert)", type="password")
+        active = st.checkbox("Aktiv", value=True)
+        ok = st.form_submit_button("Speichern")
+    if ok:
+        if not email.strip() or not name.strip():
+            st.error("Bitte E-Mail und Name ausfüllen.")
+        else:
+            h = hotel if role in ("Direktor","Techniker") else None
+            upsert_user(email.strip().lower(), name.strip(), role, h, pw if pw.strip() else None, active)
+            st.success("User gespeichert.")
+            st.rerun()
 
 
 # ---------------------------
-# App
+# Main
 # ---------------------------
 def main():
     st.set_page_config(page_title=APP_TITLE, layout="wide")
+
     init_db()
     migrate_db()
     seed_if_empty()
@@ -1838,21 +2077,22 @@ def main():
 
     if "user" not in st.session_state or not st.session_state["user"]:
         st.warning("Nicht eingeloggt.")
-        st.info("Standard-Login: admin@local / admin123 (danach User anlegen & Passwörter ändern).")
+        st.info("Standard-Login: admin@local / admin123")
         login_ui()
         return
 
     pages = {
         "Dashboard": lambda: page_dashboard(hotels_df),
+        "Auditprogramm": lambda: page_auditprogramm(hotels_df),
         "Betreiberpflichten": lambda: page_betreiberpflichten(hotels_df),
         "Audits": lambda: page_audits(hotels_df),
-        "Maßnahmen": lambda: page_massnahmen(hotels_df),
+        "Maßnahmen": lambda: page_actions(hotels_df),
     }
     if role_in("Admin"):
-        pages["Admin"] = lambda: page_admin(hotels_df)
+        pages["Admin (User)"] = lambda: page_admin(hotels_df)
+        pages["Admin (Fragenkatalog)"] = lambda: page_question_catalog(hotels_df)
 
     st.sidebar.radio("Navigation", list(pages.keys()), key="nav")
-    st.sidebar.caption("Direktor/Techniker sehen automatisch nur das eigene Hotel.")
     pages[st.session_state["nav"]]()
 
 if __name__ == "__main__":

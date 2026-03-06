@@ -360,6 +360,15 @@ def hotel_label_map(hotels_df: pd.DataFrame) -> Dict[str, str]:
     return {r["code"]: f"{r['code']} – {r['name']}" for _, r in hotels_df.iterrows()}
 
 
+def get_user_by_email(email: str):
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM users WHERE email=? AND is_active=1", (email,))
+    r = cur.fetchone()
+    conn.close()
+    return dict(r) if r else None
+
+
 def get_hotel_city(hotel_code: str) -> str:
     conn = db()
     cur = conn.cursor()
